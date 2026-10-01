@@ -22,6 +22,8 @@ func newTestServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// postJSON sends a chat-completion request and fails the test on transport
+// errors. The caller owns and must close the response body.
 func postJSON(t *testing.T, url string, body map[string]any) *http.Response {
 	t.Helper()
 	data, err := json.Marshal(body)
@@ -35,6 +37,8 @@ func postJSON(t *testing.T, url string, body map[string]any) *http.Response {
 	return resp
 }
 
+// TestServeChatCompletion exercises the embedded model through HTTP and checks
+// completion shape, finish reason, and token accounting.
 func TestServeChatCompletion(t *testing.T) {
 	srv := newTestServer(t)
 	resp := postJSON(t, srv.URL, map[string]any{
@@ -94,6 +98,8 @@ func TestServeChatCompletion(t *testing.T) {
 	}
 }
 
+// TestServeStreaming verifies opening role, text deltas, finish reason,
+// optional usage, and the terminal SSE sentinel.
 func TestServeStreaming(t *testing.T) {
 	srv := newTestServer(t)
 	resp := postJSON(t, srv.URL, map[string]any{
@@ -176,6 +182,8 @@ func TestServeStreaming(t *testing.T) {
 	}
 }
 
+// TestServeRejectsNonPost checks that the chat-completion route is available
+// only for POST requests.
 func TestServeRejectsNonPost(t *testing.T) {
 	srv := newTestServer(t)
 	resp, err := http.Get(srv.URL + "/v1/chat/completions")

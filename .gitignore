@@ -1,3 +1,55 @@
 # Compiled server binary
 /tinyoai
 /cmd/tinyoai/tinyoai
+
+# Go test binaries, native objects/libraries, and shader build outputs
+*.test
+*.exe
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.air
+*.metallib
+*.dSYM/
+
+# Downloaded checkpoints; embedded assets and small test fixtures are intentional
+/models/
+*.bin
+*.gguf
+*.safetensors
+!/assets/*.bin
+!/testdata/**/*.bin
+!/testdata/**/*.gguf
+!/testdata/**/*.safetensors
+
+# Python verification environments and bytecode
+/.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Saved prompt/KV state
+*.kv
+
+# Native MLX dependency clones, build products, and redistributable bundles
+/.build/
+/dist/
+
+# Release archives written at the repository root
+/*.tar
+/*.tar.gz
+/*.tgz
+/*.zip
+/*.dmg
+*.app/
+
+# Local profiling and coverage output
+*.prof
+/coverage.out
+/coverage.html
+
+# macOS filesystem metadata
+.DS_Store
+._*

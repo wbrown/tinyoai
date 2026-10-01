@@ -16,6 +16,7 @@ package tinyoai
 // The engine is pure standard library: no CGO, no external dependencies.
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -30,7 +31,7 @@ type Config struct {
 	HiddenDim int32 // FFN hidden dimension
 	NLayers   int32 // number of layers
 	NHeads    int32 // number of attention heads
-	NKvHeads  int32 // number of key/value heads (== NHeads in the legacy format)
+	NKvHeads  int32 // number of key/value heads (can be fewer for grouped-query attention)
 	VocabSize int32 // vocabulary size
 	SeqLen    int32 // maximum sequence length
 }
@@ -41,8 +42,8 @@ type transformerWeights struct {
 	rmsAttWeight        []float32 // (layer, dim)
 	rmsFfnWeight        []float32 // (layer, dim)
 	wq                  []float32 // (layer, dim, dim)
-	wk                  []float32 // (layer, dim, dim)
-	wv                  []float32 // (layer, dim, dim)
+	wk                  []float32 // (layer, kv_dim, dim)
+	wv                  []float32 // (layer, kv_dim, dim)
 	wo                  []float32 // (layer, dim, dim)
 	w1                  []float32 // (layer, hidden, dim)
 	w2                  []float32 // (layer, dim, hidden)
@@ -82,16 +83,18 @@ type Model struct {
 // Config returns the model's hyper-parameters.
 func (m *Model) Config() Config { return m.config }
 
-// LoadModel parses a legacy llama2.c checkpoint and its matching tokenizer.
-// It returns an error if either stream is malformed or if the checkpoint has
-// trailing bytes the weight layout does not account for (a layout mismatch).
+// LoadModel reads a legacy llama2.c checkpoint and matching tokenizer from
+// caller-owned streams. It validates basic dimensions and exact checkpoint
+// consumption; truncation and unsupported layouts return errors. Inputs must
+// be trusted local model files: allocations follow their declared dimensions.
 func LoadModel(checkpoint, tokenizer io.Reader) (*Model, error) {
 	var config Config
 	if err := binary.Read(checkpoint, binary.LittleEndian, &config); err != nil {
 		return nil, fmt.Errorf("read config header: %w", err)
 	}
-	if config.Dim <= 0 || config.NLayers <= 0 || config.NHeads <= 0 ||
-		config.VocabSize <= 0 || config.SeqLen <= 0 || config.Dim%config.NHeads != 0 {
+	if config.Dim <= 0 || config.HiddenDim <= 0 || config.NLayers <= 0 || config.NHeads <= 0 ||
+		config.NKvHeads <= 0 || config.NHeads%config.NKvHeads != 0 ||
+		config.VocabSize < 2 || config.SeqLen <= 0 || config.Dim%config.NHeads != 0 || (config.Dim/config.NHeads)%2 != 0 {
 		return nil, fmt.Errorf("invalid config header: %+v", config)
 	}
 
@@ -119,7 +122,10 @@ func LoadModel(checkpoint, tokenizer io.Reader) (*Model, error) {
 	}, nil
 }
 
-// readWeights reads each weight tensor in the legacy on-disk order.
+// readWeights reads row-major tensors in the legacy checkpoint order. Query
+// projections use all attention heads; key/value projections use only the
+// grouped KV heads. The classifier reuses the embedding table, so no separate
+// output matrix is read.
 func readWeights(r io.Reader, p *Config) (transformerWeights, error) {
 	headSize := int(p.Dim / p.NHeads)
 	kvDim := headSize * int(p.NKvHeads) // grouped-query attention: kv heads <= query heads
@@ -159,12 +165,19 @@ func readWeights(r io.Reader, p *Config) (transformerWeights, error) {
 	return w, nil
 }
 
-// readTokenizer reads the llama2.c tokenizer.bin format: a uint32 max token
-// length, then vocabSize entries of (float32 score, int32 length, bytes).
+// readTokenizer reads the llama2.c tokenizer.bin format: a uint32 maximum
+// token length followed by vocabSize entries of float32 score, int32 byte
+// length, and text. Scores rank candidate BPE merges rather than output
+// probabilities.
 func readTokenizer(r io.Reader, vocabSize int32) ([]string, []float32, uint32, error) {
 	var maxTokenLength uint32
 	if err := binary.Read(r, binary.LittleEndian, &maxTokenLength); err != nil {
 		return nil, nil, 0, fmt.Errorf("read max token length: %w", err)
+	}
+	// Legacy tokenizers are small text vocabularies. Bound both the declared
+	// maximum and each entry before allocating from checkpoint metadata.
+	if maxTokenLength == 0 || maxTokenLength > 1<<20 {
+		return nil, nil, 0, fmt.Errorf("invalid maximum token length %d", maxTokenLength)
 	}
 	vocab := make([]string, vocabSize)
 	scores := make([]float32, vocabSize)
@@ -176,6 +189,9 @@ func readTokenizer(r io.Reader, vocabSize int32) ([]string, []float32, uint32, e
 		if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
 			return nil, nil, 0, fmt.Errorf("read length %d: %w", i, err)
 		}
+		if length < 0 || uint32(length) > maxTokenLength {
+			return nil, nil, 0, fmt.Errorf("invalid token %d length %d (maximum %d)", i, length, maxTokenLength)
+		}
 		b := make([]byte, length)
 		if _, err := io.ReadFull(r, b); err != nil {
 			return nil, nil, 0, fmt.Errorf("read token %d bytes: %w", i, err)
@@ -185,52 +201,121 @@ func readTokenizer(r io.Reader, vocabSize int32) ([]string, []float32, uint32, e
 	return vocab, scores, maxTokenLength, nil
 }
 
-// GenerateOptions configures one generation call.
+// GenerateOptions configures one generation call. Fields for prepared prompts
+// and truncation apply to StableLM backends; probability capture requires native
+// MLX. Legacy Model ignores the prepared-prompt fields. Callbacks are synchronous
+// and must not reenter a backend that holds an exclusive request gate.
 type GenerateOptions struct {
-	MaxTokens   int     // maximum completion tokens (bounded by the model seq len)
+	// ExpectedPromptTokens checks a positive client-prepared token count before
+	// inference. StableLM counts BOS; LlamaMLX excludes it. Zero disables checking.
+	ExpectedPromptTokens int
+	// TokenizerID optionally checks a StableLM prepared prompt against
+	// ContextTokenizer().ID().
+	TokenizerID string
+	// Logprobs retains this many raw-model alternatives per token (native MLX).
+	Logprobs int
+	// PromptLogprobs also captures known prompt-token scores; it requires
+	// positive Logprobs and native MLX.
+	PromptLogprobs bool
+	// OnLogprobs receives synchronous raw-model probability events when capture
+	// is enabled.
+	OnLogprobs func(ProbabilityEvent)
+	// ContextLength optionally uses a smaller window than the model supports.
+	ContextLength int
+	// KVBits selects backend KV storage precision; 0 uses that backend's default.
+	KVBits int
+	// OnProgress reports completed MLX forwards, after GPU evaluation finishes.
+	OnProgress func(phase string, cachedTokens int)
+	// Sampling enables the extended sampler when non-nil; nil preserves the
+	// legacy temperature-only sampler.
+	Sampling *SamplingOptions
+	// TruncatePrompt keeps BOS and the most recent context, reserving output space.
+	TruncatePrompt bool
+	// PromptPrefix, when present, must begin prompt and is retained on truncation.
+	PromptPrefix string
+	// Context optionally cancels inference when a request is abandoned.
+	Context     context.Context
+	MaxTokens   int     // Maximum completion tokens; zero uses remaining context.
 	Temperature float64 // 0 = greedy argmax
 	Seed        int64   // RNG seed for reproducible sampling
-	Stop        []string
-	// OnToken, if set, is called with each completion token's text as it is
-	// produced, enabling token-by-token streaming.
+	// Stop lists stop strings. StableLM withholds matches; legacy Llama emits
+	// the matching text before stopping.
+	Stop []string
+	// OnToken streams decoded completion text. A callback need not correspond
+	// to exactly one token: UTF-8 and partial stop markers may be buffered.
 	OnToken func(piece string)
 }
 
 // GenerateResult is the outcome of one generation call.
 type GenerateResult struct {
-	Text             string
-	PromptTokens     int
+	// Logprobs records completion-token probabilities when capture is enabled.
+	Logprobs []TokenLogprob
+	// PromptLogprobs records scores for known prompt tokens when requested.
+	PromptLogprobs []TokenLogprob
+	// TruncatedPromptTokens counts tokens removed by backend prompt truncation.
+	TruncatedPromptTokens int
+	// Text is the completion after backend decoding and stop handling.
+	Text string
+	// PromptTokens counts prompt tokens; StableLM includes BOS, while legacy
+	// Llama excludes it.
+	PromptTokens       int
+	CachedPromptTokens int // prompt tokens reused by a backend with prefix caching
+	// CompletionTokens counts sampled tokens; StableLM includes EOS, while
+	// legacy Llama excludes its BOS stop sentinel.
 	CompletionTokens int
-	FinishReason     string // "stop" | "length"
+	FinishReason     string // "stop", "length", or "prefill" for Prefill.
 }
 
-// Generate runs autoregressive decoding from prompt and returns the completion.
-// Generation stops when the model emits the BOS/sentinel token, a stop string
-// is produced, the completion reaches MaxTokens, or the sequence length is
-// exhausted.
+// Generate runs autoregressive decoding with private activation and KV
+// buffers, allowing concurrent calls on the same immutable Model. It stops at
+// the BOS sentinel, a stop-string match, MaxTokens, or the context boundary.
+//
+// Legacy Llama accounting excludes BOS from prompt usage and does not count
+// the stop sentinel as a completion. Stop text is emitted before matching and
+// remains in the result. Callbacks are synchronous; no prefix survives between
+// calls.
 func (m *Model) Generate(prompt string, opts GenerateOptions) (GenerateResult, error) {
+	if err := validateGeneration(opts); err != nil {
+		return GenerateResult{}, err
+	}
+	if opts.Logprobs != 0 || opts.PromptLogprobs {
+		return GenerateResult{}, fmt.Errorf("logprobs require native MLX")
+	}
+	if opts.KVBits != 0 {
+		return GenerateResult{}, fmt.Errorf("kv_bits requires native MLX")
+	}
 	promptTokens, err := m.bpeEncode(prompt)
 	if err != nil {
 		return GenerateResult{}, err
 	}
 
-	maxSteps := int(m.config.SeqLen)
+	maxSteps, err := contextLength(int(m.config.SeqLen), opts.ContextLength)
+	if err != nil {
+		return GenerateResult{}, err
+	}
 	state := m.newRunState()
 	rng := rand.New(rand.NewSource(opts.Seed))
 
 	var out strings.Builder
 	completion := 0
 	finish := "length"
+	history := append([]int{1}, promptTokens...)
 	token := int32(1) // BOS, per the Llama-2 sentencepiece tokenizer
 
 	for pos := 0; pos < maxSteps; pos++ {
+		if opts.Context != nil {
+			if err := opts.Context.Err(); err != nil {
+				return GenerateResult{}, err
+			}
+		}
 		m.transformer(token, int32(pos), state)
 
 		var next int32
 		if pos < len(promptTokens) {
 			next = int32(promptTokens[pos])
 		} else {
-			next = m.sampleNext(state.logits, opts.Temperature, rng)
+			next = sampleWithOptions(state.logits, history, opts, rng)
+			history = append(history, int(next))
 			if next == 1 { // BOS/sentinel marks an end of story
 				finish = "stop"
 				break
@@ -271,7 +356,9 @@ func (m *Model) tokenPiece(prevToken, next int32) string {
 	return piece
 }
 
-// matchesStop reports whether text ends with any non-empty stop string.
+// matchesStop reports whether text contains any nonempty stop string. The tiny
+// Llama backend checks after emitting a piece, so it includes the matching
+// stop text in its output.
 func matchesStop(text string, stops []string) bool {
 	for _, s := range stops {
 		if s != "" && strings.Contains(text, s) {
@@ -281,7 +368,9 @@ func matchesStop(text string, stops []string) bool {
 	return false
 }
 
-// newRunState allocates fresh activation buffers for one generation.
+// newRunState allocates independent activations and full-context KV for one
+// legacy Llama request. KV is position-major within each layer, unlike
+// StableLM's head-major storage.
 func (m *Model) newRunState() *runState {
 	p := &m.config
 	dim := p.Dim
@@ -302,8 +391,14 @@ func (m *Model) newRunState() *runState {
 	}
 }
 
-// transformer runs one forward pass for token at position pos, writing logits
-// into state.logits.
+// transformer evaluates token at absolute position pos and replaces s.logits
+// with the next-token distribution. Earlier cache positions must already be
+// populated.
+//
+// Each layer first adds its attention output to the residual, then normalizes
+// that updated residual for the gated MLP. Grouped query heads share KV;
+// adjacent coordinate pairs use checkpoint rotary tables. The final projection
+// reuses the embedding matrix.
 func (m *Model) transformer(token, pos int32, s *runState) {
 	w := &m.weights
 	p := &m.config
@@ -380,9 +475,10 @@ func (m *Model) transformer(token, pos int32, s *runState) {
 	matmul(s.logits, x, w.tokenEmbeddingTable) // classifier tied to embedding
 }
 
-// sampleNext picks the next token: greedy argmax at temperature 0, otherwise
-// temperature-scaled softmax sampling with the supplied RNG.
-func (m *Model) sampleNext(logits []float32, temperature float64, rng *rand.Rand) int32 {
+// sampleNext returns a greedy argmax at temperature zero, or samples
+// temperature-scaled softmax probabilities with rng. The sampling path
+// overwrites logits; callers needing raw model scores must copy them first.
+func sampleNext(logits []float32, temperature float64, rng *rand.Rand) int32 {
 	if temperature == 0 {
 		return argmax(logits)
 	}
@@ -445,6 +541,9 @@ func (m *Model) strLookup(str string) int {
 // ----------------------------------------------------------------------------
 // Math primitives
 
+// softmax replaces logits with normalized probabilities in place. Subtracting
+// the largest logit prevents exponential overflow; an empty slice is
+// unchanged. Inputs are expected to be finite.
 func softmax(x []float32) {
 	if len(x) == 0 {
 		return
@@ -465,6 +564,9 @@ func softmax(x []float32) {
 	}
 }
 
+// matmul writes W*x to xout, interpreting w as contiguous output rows of
+// len(x) elements. This small-model reference uses sequential float32
+// accumulation. The input must be nonempty and must not overlap the output.
 func matmul(xout, x, w []float32) {
 	n := len(x)
 	d := len(w) / n
@@ -478,6 +580,9 @@ func matmul(xout, x, w []float32) {
 	}
 }
 
+// rmsNorm writes weight-scaled root-mean-square normalization of src to dest,
+// using the legacy Llama epsilon of 1e-5. All slices have the same nonzero
+// length; dest may alias src.
 func rmsNorm(dest, src, weight []float32) {
 	var sumSquares float32
 	for _, v := range src {
@@ -489,6 +594,7 @@ func rmsNorm(dest, src, weight []float32) {
 	}
 }
 
+// accum adds b to a in place. Both vectors must have the same length.
 func accum(a, b []float32) {
 	for i := range a {
 		a[i] += b[i]
@@ -506,6 +612,8 @@ func rotateHead(vec, freqReal, freqImag []float32, headSize int32) {
 	}
 }
 
+// argmax returns the index of the largest element of a nonempty slice. Strict
+// comparison preserves the earliest index when logits tie.
 func argmax(v []float32) int32 {
 	maxI, maxP := 0, v[0]
 	for i := 1; i < len(v); i++ {
@@ -516,7 +624,9 @@ func argmax(v []float32) int32 {
 	return int32(maxI)
 }
 
-// sampleDist samples an index from a probability distribution that sums to 1.
+// sampleDist draws an index using rng from a nonempty probability distribution
+// whose sum is approximately one. If rounding leaves a gap at the end of the
+// cumulative distribution, the last index absorbs it.
 func sampleDist(probabilities []float32, rng *rand.Rand) int32 {
 	r := rng.Float32()
 	var cdf float32

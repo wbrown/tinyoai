@@ -1,10 +1,38 @@
 package tinyoai
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
+	"strings"
 	"testing"
 )
+
+// TestLoadInvalidLlamaDimensions rejects invalid hidden sizes, grouped-query
+// head counts, rotary widths, and vocabularies before allocating weights.
+func TestLoadInvalidLlamaDimensions(t *testing.T) {
+	valid := Config{Dim: 64, HiddenDim: 172, NLayers: 5, NHeads: 8, NKvHeads: 4, VocabSize: 512, SeqLen: 512}
+	for name, change := range map[string]func(*Config){
+		"hidden":          func(c *Config) { c.HiddenDim = -1 },
+		"zero KV heads":   func(c *Config) { c.NKvHeads = 0 },
+		"uneven GQA":      func(c *Config) { c.NKvHeads = 3 },
+		"odd rotary head": func(c *Config) { c.Dim = 56 },
+		"no BOS":          func(c *Config) { c.VocabSize = 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := valid
+			change(&c)
+			var checkpoint bytes.Buffer
+			if err := binary.Write(&checkpoint, binary.LittleEndian, c); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadModel(&checkpoint, bytes.NewReader(nil))
+			if err == nil || !strings.Contains(err.Error(), "invalid config header") {
+				t.Fatalf("must reject invalid dimensions before allocating weights: %v", err)
+			}
+		})
+	}
+}
 
 // TestEmbeddedModelLayout pins the embedded stories260K config and verifies the
 // on-disk weight count matches the GQA layout exactly (header + every tensor).
