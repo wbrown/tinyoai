@@ -47,8 +47,8 @@ func TestGenerate(t *testing.T) {
 	}
 }
 
-// TestGenerateGreedyEndToEnd checks greedy decoding (temperature 0) and that
-// MaxTokens bounds the completion, yielding a "length" finish.
+// TestGenerateGreedy checks that greedy decoding obeys MaxTokens and reports a
+// length-limited finish.
 func TestGenerateGreedy(t *testing.T) {
 	m, err := Default()
 	if err != nil {
