@@ -4,7 +4,9 @@ Native MLX runs the embedded Llama and local MLX-format StableLM checkpoints on 
 
 MLX uses the Metal GPU, not the Neural Engine. Go manages layers, tokenization, sampling, requests, and prefix reuse. See the [CPU/MLX measurements](backend-comparison.md) and [server commands](../README.md#running-with-native-mlx).
 
-The [feature guide](inference-features.md) covers cache validity, cancellation, sampling, probability capture, and branching.
+The [feature guide](inference-features.md) covers cache validity, cancellation, sampling, probability capture, token branches, and independent generation forks.
+
+StableLM also supports [native LoRA adapters](lora.md), with one adapter per session, adjustable strength, and optional server controls for switching without reloading base weights.
 
 ## Embedded tiny Llama
 
@@ -114,11 +116,17 @@ Each model serializes requests. MLX command submission also uses a process-wide 
 
 `Close` releases weights and KV. `mlxruntime` reports active, peak, and idle allocations separately from Go's heap. Native KV is memory-only. See [cache lifetime](inference-features.md#cache-precision-capacity-and-memory).
 
+Native StableLM also implements `Forker`. `Fork(ctx)` returns a `GenerationSession` with independent token history, probability records, KV position, adapter selection, and request gate. Base weights, adapter tensors, and initial KV share storage through separately retained handles. Closing either session leaves the other usable.
+
+Forking is unavailable for CPU, Python, and native Llama; the Python-backed `MLX.Fork` returns an unsupported-backend error. The [LoRA guide](lora.md#selecting-an-adapter-on-a-fork) shows how to change a child's adapter while preserving the parent's state. Changing the child's effective weights requires rebuilding its KV.
+
+Forking itself does not copy tensor storage. Subsequent writes to shared KV can copy a layer's complete cache, so a long-lived fork can retain another full KV allocation. It is not a suffix-only branch. Call `Close` on each fork when no longer needed. `TestMLXForkIsolation`, enabled with `TINYOAI_MLX_DIR`, checks both KV precisions, cache growth, rewind, and parent/child lifetimes on Metal.
+
 ## Optional Python worker
 
 `LoadMLX(python, directory)` or `-mlx-python /path/to/python` starts a persistent MLX-LM worker. Install the versions listed in `scripts/mlx_worker.py` in that interpreter. Go handles tokenization, sampling, and HTTP; the worker evaluates local weights. This path requires Python and MLX at runtime, but no cgo link or `mlx` build tag.
 
-The worker supports generation and prefix reuse, but lacks probability capture, configurable KV precision, and branch sessions. Cancellation during an exchange kills the worker and discards its prefix. The next request restarts it.
+The worker supports generation and prefix reuse, but lacks probability capture, configurable KV precision, token branches, generation forks, and LoRA controls. Cancellation during an exchange kills the worker and discards its prefix. The next request restarts it.
 
 ## Implementation and validation
 

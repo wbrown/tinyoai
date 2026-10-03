@@ -25,7 +25,7 @@ The default CPU build is portable and uses only Go's standard library. Native ML
 | StableLM weights | Original BF16/F16/F32 safetensors or supported GGUF formats | Converted FP16 or affine group-64 2/3/4/5/6/8-bit MLX safetensors |
 | Arithmetic | Float32 activations; StableLM projections use higher-precision accumulation | Float32 for legacy Llama; float16 activations for StableLM |
 | StableLM KV storage | Float32 default, optional float16 | Float16 default, optional affine 8-bit |
-| Prefix reuse | StableLM retains one reusable prefix; legacy Llama allocates per request | Both architectures retain one reusable prefix per loaded model |
+| Prefix reuse | StableLM retains one reusable prefix; legacy Llama allocates per request | Both architectures retain one reusable prefix per instance; StableLM can fork sessions |
 | Cache persistence | StableLM `SaveCache` / `LoadCache` and `-cache-file` | Memory only |
 | HTTP | Chat/text completions, SSE, cancellation, token usage | Same endpoints and framing |
 
@@ -58,14 +58,16 @@ Both CPU engines use KV during generation. Llama CPU allocates private KV for ea
 | Extended sampling controls | Yes | Yes | Yes | Yes |
 | Prompt/completion logprobs | No | No | Yes | Yes |
 | Batched isolated token branches | No | No | No | `OpenBranches` |
+| Independent generation forks | No | No | No | [`Fork`](docs/inference-features.md#independent-generation-sessions) |
+| Ordinary PEFT LoRA adapters | No | No | No | [`LoadLoRA` / `SetLoRAScale`](docs/lora.md) |
 | Protected-prefix prompt truncation | No | Yes | No | Yes |
 | Progress callbacks | No | No | `OnProgress` | `OnProgress` |
 
 Extended sampling includes temperature, top-k, top-p, tail-free sampling, and repetition, presence, and frequency penalties.
 
-For prefix reuse, keep the model instance and submit the full updated prompt. Each model retains one prefix. `CachedPromptTokens` reports reused positions; HTTP usage exposes `prompt_tokens_details.cached_tokens` when nonzero.
+For prefix reuse, keep the model instance and submit the full updated prompt. Each instance retains one prefix. Native StableLM can fork that prefix into an independent session with shared base weights. `CachedPromptTokens` reports reused positions; HTTP usage exposes `prompt_tokens_details.cached_tokens` when nonzero.
 
-The [inference feature guide](docs/inference-features.md) covers cache validity, memory, cancellation, sampling, probabilities, branching, and HTTP access. It also lists the Python worker's limitations.
+The [inference feature guide](docs/inference-features.md) covers cache validity, memory, cancellation, sampling, probabilities, token branches, generation forks, LoRA, and HTTP access. It also lists the Python worker's limitations.
 
 ## Library use
 
@@ -156,7 +158,9 @@ Use `"model":"clio-cpu"` to select CPU inference. Each model loads its own weigh
 
 Install `WithCompletionExtension` to decode extra request fields, decorate results, or encode probability events. The server handles model selection, cancellation, and SSE framing. Add routes with `http.ServeMux`; `SelectModel` provides the completion endpoints' model routing and errors.
 
-`Prefiller`, `TokenizerProvider`, and `Brancher` are optional interfaces. Close each branch session to release the model's generation gate.
+`Prefiller`, `TokenizerProvider`, `Brancher`, `Forker`, and `LoRAController` are optional interfaces. Close each token-branch session to release the parent's generation gate. Generation forks have their own gates; close each fork to release its cache and shared-weight references.
+
+Native StableLM supports independent forks and per-session LoRA. The standalone command can expose registered adapters through the optional [`/v1/adapters` controls](docs/lora.md#server-controls). Adapter selection applies to subsequent requests on that model; it is not a completion parameter.
 
 The `tokenizer` package provides Nerdstash encoding; `tokenizerinfo` describes its format and identity. `mlxruntime` provides native allocator statistics and cache release. `servercmd.Main` supplies model loading and HTTP lifecycle for commands with custom handlers.
 
@@ -240,7 +244,7 @@ For example, after building the SIMD server:
 
 Measure worker counts on the target machine; memory bandwidth and scheduling overhead limit scaling.
 
-This loader supports the documented Clio-compatible StableLM variant and tokenizer settings. NovelAI modules and LoRA are unsupported.
+The CPU loader supports the documented Clio-compatible StableLM variant and tokenizer settings. It does not support NovelAI modules or LoRA. The native StableLM MLX backend supports [ordinary PEFT LoRA adapters](docs/lora.md).
 
 These saved CPU validation timings used eight SIMD workers on an Apple M5 with 32 GiB memory. Other workloads were active. Decode rates exclude distribution checks and trace writes; peak RSS includes the test harness.
 

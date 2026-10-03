@@ -15,6 +15,9 @@ func (n *nativeMLX) packProjections() error {
 	if n.projectionsPacked {
 		return nil
 	}
+	if n.lora != nil {
+		return fmt.Errorf("pack base projections before loading a LoRA")
+	}
 	return mx.Run(func() {
 		for i := range n.layers {
 			l := &n.layers[i]

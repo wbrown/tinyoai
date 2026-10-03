@@ -26,6 +26,7 @@ type nativeMLX struct {
 	ctx                 *mx.Context
 	config              StableLMConfig
 	weights             map[string]mx.Array
+	lora                *mlxLoRA
 	layers              []mlxLayer
 	embed, head         mlxMatrix
 	norm, bias          mx.Array
@@ -169,10 +170,23 @@ func (n *nativeMLX) matrix(name string, rows, cols int) mlxMatrix {
 	return mlxMatrix{n.weight(name+".weight", mx.Uint32, rows, cols*n.bits/32), n.weight(name+".scales", mx.Float16, rows, cols/n.group), n.weight(name+".biases", mx.Float16, rows, cols/n.group)}
 }
 
-// linear projects activations through weight rows using dense or quantized
-// multiplication. The opt-in dense-prefill experiment reconstructs large
-// quantized projections temporarily; ordinary inference keeps them packed.
+// linear adds an optional low-rank correction to the original projection.
+// Prefill, decoding, saved probabilities, and branches share this operation;
+// the adapter never merges into or requantizes the base weight matrix.
 func (n *nativeMLX) linear(a *mx.Arena, x mx.Array, w mlxMatrix) mx.Array {
+	y := n.baseLinear(a, x, w)
+	if n.activeLoRA() {
+		if pair, ok := n.lora.pairs[w.weight]; ok {
+			delta := a.Matmul(a.Matmul(x, a.Transpose(pair.a, 1, 0)), a.Transpose(pair.b, 1, 0))
+			y = a.Add(y, a.Scale(delta, n.lora.factor))
+		}
+	}
+	return y
+}
+
+// baseLinear preserves the original dense and quantized projection paths.
+// A zero-strength adapter skips its graph entirely, retaining base numerics.
+func (n *nativeMLX) baseLinear(a *mx.Arena, x mx.Array, w mlxMatrix) mx.Array {
 	if n.bits == 16 {
 		return a.Matmul(x, a.Transpose(w.weight, 1, 0))
 	}
@@ -218,6 +232,8 @@ func (n *nativeMLX) LimitCache(limit int) (cleared bool, err error) {
 func (n *nativeMLX) Close() error {
 	return mx.Run(func() {
 		n.reset()
+		n.lora.free()
+		n.lora = nil
 		for _, w := range n.weights {
 			w.Free()
 		}
@@ -327,7 +343,7 @@ func (n *nativeMLX) forward(ctx context.Context, prefix int, tokens []int, wantL
 			}
 			h := a.Norm(x, l.norm, l.bias, c.LayerNormEps)
 			var q, k, v mx.Array
-			if n.fusedProjections {
+			if n.fusedProjections && !n.activeLoRA() {
 				qkv := n.linear(a, h, l.qkv)
 				kv := c.NumKeyValueHeads * dim
 				q = a.Slice(qkv, 2, 0, c.HiddenSize)
@@ -352,7 +368,7 @@ func (n *nativeMLX) forward(ctx context.Context, prefix int, tokens []int, wantL
 			}
 			r := n.linear(a, a.Reshape(a.Transpose(attn, 0, 2, 1, 3), 1, length, c.HiddenSize), l.o)
 			var gate, up mx.Array
-			if n.fusedProjections {
+			if n.fusedProjections && !n.activeLoRA() {
 				both := n.linear(a, h, l.gateUp)
 				gate, up = a.Slice(both, 2, 0, c.IntermediateSize), a.Slice(both, 2, c.IntermediateSize, 2*c.IntermediateSize)
 			} else {

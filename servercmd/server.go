@@ -35,7 +35,17 @@ func Main(factory func(map[string]tinyoai.Generator, []string) (http.Handler, er
 	cacheFile := flag.String("cache-file", "", "restore Clio prefix state at startup and save it on graceful shutdown")
 	readyFile := flag.String("ready-file", "", "write the bound address to this file when ready (process supervisor)")
 	parentPID := flag.Int("parent-pid", 0, "stop if this parent process exits (process supervisor)")
+	loraPaths := loRAFlags{}
+	flag.Var(loraPaths, "lora", "register name=directory for native StableLM LoRA testing (repeatable; enables /v1/adapters)")
+	loraActive := flag.String("lora-active", "base", "registered adapter to load initially, or base")
+	loraScale := flag.Float64("lora-scale", 1, "initial LoRA strength, multiplied by alpha/rank")
 	flag.Parse()
+	if len(loraPaths) > 0 && (!*mlxNative || *modelDir == "") {
+		log.Fatal("lora requires mlx and a StableLM model-dir")
+	}
+	if *loraActive != "base" && loraPaths[*loraActive] == "" {
+		log.Fatal("lora-active must name a registered adapter or base")
+	}
 	if *cpuModel != "" && !*mlxNative && *mlxPython == "" {
 		log.Fatal("cpu-model requires an MLX backend; for CPU only, use model-dir")
 	}
@@ -136,6 +146,18 @@ func Main(factory func(map[string]tinyoai.Generator, []string) (http.Handler, er
 	}
 	if err != nil {
 		log.Fatal(err)
+	}
+	if len(loraPaths) > 0 {
+		adapters := newLoRAHandler(handler, models, loraPaths)
+		if *loraActive != "base" {
+			info, err := adapters.models[name].LoadLoRA(ctx, loraPaths[*loraActive], *loraScale)
+			if err != nil {
+				log.Fatalf("load LoRA: %v", err)
+			}
+			adapters.selected[name] = *loraActive
+			log.Printf("tinyoai: LoRA %s sha256=%s scale=%g", *loraActive, info.SHA256, info.Scale)
+		}
+		handler = adapters
 	}
 	srv := &http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute, BaseContext: func(net.Listener) context.Context { return ctx }}
 	listener, err := net.Listen("tcp", *addr)
