@@ -1,6 +1,6 @@
 # Inference features
 
-The [feature matrix](../README.md#inference-features) lists support by backend. CPU StableLM provides KV reuse, batched prefill, and disk persistence. MLX backends expose prefill-only calls. Probability capture requires native MLX.
+The [feature matrix](../README.md#inference-features) lists support by backend. CPU StableLM provides KV reuse, batched prefill, and disk persistence. MLX backends expose prefill-only calls. Probability capture requires native MLX; independent generation forks and LoRA require native StableLM MLX.
 
 ## KV during decoding and between requests
 
@@ -19,6 +19,8 @@ Once a prefill chunk completes, every position in it has valid KV. An edit insid
 Generated tokens become reusable after their forward passes complete. The final sampled token may not yet have KV.
 
 KV depends on preceding tokens and absolute position. Deleting text or shifting a suffix requires reevaluating that suffix; an unchanged leading prefix can remain cached. The engine has no sliding-window KV transform or per-session cache pool.
+
+KV and saved probabilities also depend on the effective model weights. Loading, unloading, or changing a LoRA's strength clears that session's prefix and probability records, even when prompt tokens remain identical.
 
 `GenerateResult.CachedPromptTokens` counts reused prompt positions. HTTP usage includes `prompt_tokens_details.cached_tokens` when positive. For streaming usage, set `stream_options.include_usage`. StableLM counts include BOS; legacy Llama counts exclude it.
 
@@ -41,6 +43,26 @@ CPU StableLM grows capacity in powers of two up to the model limit. Native cache
 Legacy CPU Llama allocates for the checkpoint's full context per request. Lowering `ContextLength` does not shrink that allocation.
 
 `mlxruntime.Memory` reports active, peak, and idle native buffers separately from Go's heap. `ClearCache` frees idle buffers. `ResetPeakMemory` also clears idle buffers before resetting the peak. Neither releases live weights or KV; `Close` releases the model's retained arrays. See [memory accounting](backend-comparison.md#native-mlx-observations).
+
+## Independent generation sessions
+
+Native StableLM implements `Forker`. `Fork(ctx)` snapshots the currently retained prefix and returns a `GenerationSession` with independent token history, saved probability records, adapter selection, and request gate. Fork creation waits for the parent's active work; that wait can cancel.
+
+The child retains separate native handles to shared base weights, adapter tensors, and KV. Go token and probability slices are copied immediately. A later write to shared KV can copy a layer's full cache, so a diverged fork may retain another complete KV allocation. Budget for that growth using the cache sizes above.
+
+Pass the full desired prompt to the child's `Generate`, with the same KV precision to preserve reuse. Parent and child can then accept independent requests, though native command submission still uses the process-wide MLX lock. Each session remains usable after the other closes. Call `Close` on every fork to release its retained handles.
+
+`OpenBranches` holds the parent's generation gate while exploring a batch of short suffixes. `Fork` releases the parent gate after the snapshot and returns a normal generator for ongoing use. CPU and native Llama do not support forks. Python-backed `MLX` values expose `Fork` but return an unsupported-backend error.
+
+## Per-session LoRA adapters
+
+Native StableLM implements `LoRAController`: `LoadLoRA` attaches one ordinary PEFT adapter, `SetLoRAScale` changes its strength, and `LoRAInfo` reports its identity and retained tensor bytes. CPU, native Llama, and Python inference do not support adapter execution.
+
+Adapters add low-rank corrections to attention and MLP projections while leaving the base weights unchanged. Zero strength bypasses the correction but retains the adapter tensors. Loading an empty directory unloads them. Successful changes invalidate only the receiving session's cache; failed loads preserve its previous adapter and prefix.
+
+A fork inherits the parent's adapter and strength, sharing immutable adapter storage. Either session can then select a different adapter or strength. Changing the child requires fresh prefill there because its inherited KV was computed with different effective weights. Closing or changing one session leaves the other's adapter usable.
+
+See [native LoRA inference](lora.md) for supported tensor formats, scaling, replacement semantics, and a fork-and-select example. Adapter selection does not supply a prompt template or change stop strings.
 
 ## Persisting CPU StableLM KV
 
@@ -133,10 +155,12 @@ Both endpoints limit request bodies to 4 MiB and share SSE delivery. Every frame
 
 Per-request KV precision, prompt logprobs, protected-prefix truncation, top-k, tail-free sampling, and repetition controls require a `CompletionExtension` to expose them as JSON fields.
 
-Prefill-only calls, tokenizer assets, and branch sessions need caller-provided HTTP routes. See [extension hooks](../README.md#optional-application-extensions).
+Prefill-only calls, tokenizer assets, token branches, and fork creation need caller-provided HTTP routes. A library caller can also register a fork under its own model ID with `NewModelServer`. See [extension hooks](../README.md#optional-application-extensions).
+
+The standalone command enables optional `GET` and `POST /v1/adapters` controls when started with registered `-lora name=directory` flags. Clients select registered names rather than paths. Selection applies to the resident model across completion requests; it is not a standard OpenAI request field. Both the endpoint queue and the model queue allow cancellation. See [server controls](lora.md#server-controls).
 
 ## Optional Python MLX worker
 
-`LoadMLX` starts a persistent Python StableLM worker. It supports prefix reuse, 512-token prefill, `Prefill`, shared sampling, and progress callbacks. Native probability capture, selectable KV precision, and branches are unavailable.
+`LoadMLX` starts a persistent Python StableLM worker. It supports prefix reuse, 512-token prefill, `Prefill`, shared sampling, and progress callbacks. Native probability capture, selectable KV precision, token branches, generation forks, and LoRA controls are unavailable.
 
 Cancelling an active exchange terminates the worker and discards its cache. The next request restarts it. See [Python worker setup](mlx-native.md#optional-python-worker).

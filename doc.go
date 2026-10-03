@@ -30,7 +30,12 @@
 //   - sampling.go and logprobs.go turn logits into choices and observations.
 //   - mlx.go and mlx_native.go preserve the generation cycle while delegating
 //     tensor evaluation to MLX. mlx_llama.go does the same for legacy Llama.
+//   - sessions.go and mlx_sessions.go explain how independent generation
+//     sessions retain a prefix without copying its tensor storage immediately.
+//   - lora.go and mlx_lora.go attach low-rank corrections to a session and
+//     invalidate activations when its effective weights change.
 //   - server.go, completions.go, and models.go adapt generation to HTTP.
+//     servercmd/lora.go adds optional controls for registered local adapters.
 //
 // # A forward pass predicts the following token
 //
@@ -49,7 +54,7 @@
 //
 // [Model] has immutable weights and allocates independent state for each call.
 // [StableLM], [MLX], and [LlamaMLX] instead retain one token prefix and KV cache
-// per model. Their request gates serialize generation, prefill, and lifecycle
+// per instance. Their request gates serialize generation, prefill, and lifecycle
 // operations. Callbacks run synchronously; a callback must not call back into
 // the same gated model. Separate registered models have separate request gates.
 //
@@ -67,7 +72,9 @@
 // the row predicting the first changed token. Rewinding changes the valid length,
 // while capacity can remain allocated. Attention must see only the valid prefix.
 // Changing KV precision or reducing an oversized retained context invalidates
-// the corresponding cache.
+// the corresponding cache. Loading, unloading, or changing the strength of an
+// adapter also invalidates KV and saved probabilities: the same tokens now
+// pass through different effective weights.
 //
 // CPU StableLM KV is [layer][KV head][position][feature]. Legacy CPU Llama KV
 // is [layer][position][KV head][feature]. Native arrays add a batch axis and use
@@ -76,6 +83,34 @@
 // head's prefix separately. Tests exercise growth, rewind, and final positions.
 // [StableLM.SaveCache] persists only valid CPU positions with a model identity
 // and checksum; native MLX caches are currently memory-only.
+//
+// # Independent sessions and adapter state
+//
+// Native StableLM [MLX.Fork] snapshots a session's retained prefix, probability
+// records, and adapter selection. The child has its own request gate and can
+// generate after the snapshot releases the parent's gate. [Brancher] instead
+// holds the parent gate for a temporary batch of suffix explorations; closing
+// that branch session lets generation on the parent resume.
+//
+// A fork retains its own native handles to shared base weights, adapter tensors,
+// and KV. The Go token and probability slices are copied. MLX can copy a layer's
+// full shared KV buffer on a later write, so a diverged fork may retain another
+// full cache. The caller must close each [GenerationSession]; closing a parent
+// or child leaves the other's handles valid. Native submission still shares the
+// process-wide MLX lock, so separate sessions do not promise parallel GPU work.
+//
+// [LoRAController] changes a session's projections without modifying base
+// weights. Each adapted projection adds a pair of low-rank matrix products,
+// scaled by strength times alpha/rank. Zero strength bypasses the correction.
+// Native StableLM stores adapter tensors in FP16 alongside dense or quantized
+// base weights; CPU, native Llama, and Python inference do not support adapters.
+//
+// Replacement is prepared before it is committed. The loader validates and
+// evaluates new tensors while retaining the old adapter and cache. On success,
+// it replaces the adapter and clears native KV before Go discards its token and
+// probability records. Failure before commit preserves the old state. Changes
+// affect only the owning session; a fork with a different adapter must rebuild
+// its own KV. See docs/lora.md for format limits and a library example.
 //
 // # Precision and native lifetime
 //
@@ -96,11 +131,19 @@
 // # Serving and extending
 //
 // [Generator] is the minimal serving contract. [Prefiller], [TokenizerProvider],
-// and [Brancher] are optional capabilities, not requirements of every backend.
+// [Brancher], [Forker], and [LoRAController] describe optional capabilities.
+// Native StableLM supports forks and LoRA; Python-backed [MLX] values expose
+// these methods but return unsupported-backend errors.
 // [NewModelServer] gives generators explicit model IDs. [WithCompletionExtension]
 // adds text-completion request and response policy while the server retains
 // routing, cancellation, and streaming. Additional HTTP handlers compose with
 // the server through net/http; extensions are optional for every backend.
+//
+// The standalone command can register local adapters and expose /v1/adapters.
+// Its cancellable gate keeps selection metadata consistent with model changes;
+// the model gate also serializes those changes with inference. Selection applies
+// to a resident model across requests, so clients cannot bind an adapter change
+// and a later completion into one atomic request through this endpoint.
 //
 // The HTTP interface is deliberately a subset: chat messages are flattened into
 // text, roles do not add a template, and tool execution is not implemented.
