@@ -4,6 +4,8 @@ The CPU backend uses only Go's standard library. Native MLX adds Apple Silicon G
 
 The [feature guide](inference-features.md) covers cache reuse, persistence, cancellation, sampling, probabilities, and branching.
 
+The newer [inference measurements](inference-benchmarks.md) add M3 Ultra, M4, and A17 Pro results, Q8 KV memory measurements, and batched evaluation. Their prompt scoring and KV settings differ from the forward-only tables below.
+
 These measurements use the 3-billion-parameter Clio StableLM checkpoint. They do not predict stories260K performance, where GPU dispatch can cost more than the small matrix operations.
 
 ## What changes in the inference loop
@@ -16,7 +18,7 @@ Prefill reuses weights across many positions. Decode produces one position per f
 
 In these CPU runs, Q6_K and Q5_K_M saved storage but decoded more slowly than Q8_0. MLX lower-bit weights generally improved decode while prefill stayed similar. Results depend on the kernels and hardware.
 
-Each StableLM model retains one prefix and serializes requests. MLX also has a process-wide submission lock. Neither backend combines concurrent requests into inference batches. CPU StableLM supports disk snapshots; native MLX keeps KV in memory.
+Each StableLM model retains one prefix and serializes ordinary generation requests. MLX also has a process-wide submission lock. The HTTP server does not combine arriving requests into batches. A development evaluator groups equal-length prompts for offline measurements; this API has not landed on `main`. See the [batching measurements](inference-benchmarks.md#batched-independent-evaluation). CPU StableLM supports disk snapshots; native MLX keeps KV in memory.
 
 ## Measurement conditions
 
@@ -84,12 +86,20 @@ Results include FP16 arithmetic differences and weight quantization error. Argma
 | Q8 | 512 + 256 | 254/256 | 0.000140222156 | 0.000932272132 |
 | Q6 | 512 + 256 | 249/256 | 0.002880635091 | 0.024466845076 |
 | Q5 | 512 + 256 | 236/256 | 0.009879625755 | 0.059590967449 |
+| Q4 | 512 + 256 | 201/256 | 0.117690796432 | 0.569336247191 |
+| Q3 | 512 + 256 | 59/256 | 3.563415503759 | 12.541860202618 |
+| Q2 | 512 + 256 | 0/256 | 9.141731660754 | 14.090826862565 |
 | FP16 | 8129 + 64 | 64/64 | 0.000000868282 | 0.000029212052 |
 | Q8 | 8129 + 64 | 64/64 | 0.000049726349 | 0.001460507242 |
 | Q6 | 8129 + 64 | 64/64 | 0.000813665507 | 0.014327933753 |
 | Q5 | 8129 + 64 | 63/64 | 0.001903803885 | 0.024004135237 |
+| Q4 | 8129 + 64 | 62/64 | 0.028584880556 | 0.744359804809 |
+| Q3 | 8129 + 64 | 13/64 | 5.137225712367 | 12.618314506376 |
+| Q2 | 8129 + 64 | 0/64 | 9.168714026431 | 18.458912637105 |
 
-All 40 short/long traces matched their same-precision Python MLX references bit for bit. The 2048- and 4096-token trials used slices of the long history and had no independent CPU reference, so only their performance appears here. Accuracy results cover fixed histories rather than broad model quality.
+Q4/Q3/Q2 come from the separate affine group-64 sweep on the same reference histories. Its [storage and peak-allocation table](inference-benchmarks.md#lower-bit-weights) and [portable results](benchmarks/inference-2026-10.json) retain the measured tradeoffs. All 36 quantized native traces in that sweep matched Python MLX at the same precision; Q3/Q2's large divergence from the original checkpoint is weight-quantization error.
+
+All 40 short/long traces in the original five-trial FP16/Q8/Q6/Q5 series matched their same-precision Python MLX references bit for bit. The 2048- and 4096-token trials used slices of the long history and had no independent CPU reference, so only their performance appears here. Accuracy results cover fixed histories rather than broad model quality.
 
 ## Evidence and reproduction
 

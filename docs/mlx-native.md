@@ -4,6 +4,8 @@ Native MLX runs the embedded Llama and local MLX-format StableLM checkpoints on 
 
 MLX uses the Metal GPU, not the Neural Engine. Go manages layers, tokenization, sampling, requests, and prefix reuse. See the [CPU/MLX measurements](backend-comparison.md) and [server commands](../README.md#running-with-native-mlx).
 
+The [inference benchmark report](inference-benchmarks.md) adds M3 Ultra, M5, M4, and A17 Pro timings, KV precision and memory, cancellation, token branches, and batched offline evaluation. Its portable JSON preserves individual results and measurement settings.
+
 The [feature guide](inference-features.md) covers cache validity, cancellation, sampling, probability capture, token branches, and independent generation forks.
 
 StableLM also supports [native LoRA adapters](lora.md), with one adapter per session, adjustable strength, and optional server controls for switching without reloading base weights.

@@ -42,6 +42,8 @@ CPU used float32 KV; MLX used float16 KV. GGUF Q8_0 and MLX Q8 use different qua
 
 See the [backend comparison](docs/backend-comparison.md) for FP16, Q8, Q6, and Q5 results at four context lengths, including memory and accuracy. GPU dispatch overhead can outweigh inference work for the tiny embedded model. The [native MLX guide](docs/mlx-native.md) covers setup and library use.
 
+The newer [inference measurements](docs/inference-benchmarks.md) cover M3 Ultra, M5, M4, and A17 Pro with Q6 weights, Q8 KV, and prompt probabilities enabled. The M3 Ultra measured 1.517-second prefill and 114.80 decode tokens/s for a 4043-token prompt, and 3.293 seconds and 106.01 tokens/s for 8160 tokens. That report also covers KV memory savings, prefix reuse, cancellation, suffix branches, lower-bit weights, and batched offline evaluation.
+
 ## Inference features
 
 Both CPU engines use KV during generation. Llama CPU allocates private KV for each request. StableLM CPU retains it across requests, reuses the longest unchanged token prefix, and supports disk snapshots.

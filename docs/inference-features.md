@@ -38,6 +38,8 @@ Dense KV requires approximately `2 × layers × KV heads × head width × alloca
 
 Native 8-bit KV includes group scales and biases. Prefill reconstructs one layer for attention; no dense copy is retained permanently.
 
+At 8192 Clio positions, measured retained native KV is 2.584 GB for FP16 and 1.373 GB for Q8, a 46.875% reduction. The [KV measurements](inference-benchmarks.md#kv-precision-and-memory) include process footprint, timings, and full-vocabulary numerical agreement. Peak process savings are smaller than retained-cache savings because prefill still needs temporaries.
+
 CPU StableLM grows capacity in powers of two up to the model limit. Native caches grow in 256-position blocks. Rewind shortens the valid prefix but usually retains capacity. A smaller context setting can release an oversized cache.
 
 Legacy CPU Llama allocates for the checkpoint's full context per request. Lowering `ContextLength` does not shrink that allocation.
@@ -81,7 +83,9 @@ The server restores the snapshot at startup and saves on Ctrl+C or SIGTERM. Abru
 
 ## Prefill, cancellation, and concurrency
 
-CPU StableLM prefill batches contain up to 128 tokens; native Llama uses 64 and native StableLM uses 512. All decode one token at a time. Each batch belongs to one prompt; independent requests are not combined.
+CPU StableLM prefill batches contain up to 128 tokens; native Llama uses 64 and native StableLM uses 512. Ordinary generation decodes one token at a time. These prefill batches contain positions from one prompt; the HTTP server does not combine independent requests.
+
+A development evaluator, not yet available on `main`, separately groups equal-length prompts with independent FP16 KV, random state, sampling history, and stopping conditions. On the M3 Ultra, a limit of 16 reduced a 32-request greedy evaluation panel from 21.094 to 9.674 seconds. See [batched evaluation](inference-benchmarks.md#batched-independent-evaluation) for the exact panel, numerical differences, and sampled-output results.
 
 `LlamaMLX` and `MLX` implement `Prefiller`, preparing a prefix without sampling. Success returns `FinishReason: "prefill"` and zero completion tokens.
 
@@ -146,6 +150,8 @@ Prompt scoring adds output projections and retained score rows. Enabling it afte
 Native StableLM implements `Brancher`. `OpenBranches` validates a saved prefix fingerprint and seed tokens from a retained probability row. Each `Forward` advances one token per branch and returns full-vocabulary logits.
 
 Branches share a read-only prefix and own their suffix storage. Close the session to release that storage and the model gate before generating again. Native Llama and CPU backends do not support branches.
+
+The [suffix-branch measurements](inference-benchmarks.md#shared-prefix-suffix-branches) compare serial and batched expansion of eight seeds near the 8192-position limit on four Apple devices, including temporary memory and logprob differences.
 
 ## Library features and the base HTTP API
 
