@@ -257,6 +257,9 @@ func (m *MLX) generate(prompt string, opts GenerateOptions, prefillOnly bool) (G
 	if err := validateGeneration(opts); err != nil {
 		return GenerateResult{}, err
 	}
+	if opts.Logprobs > m.config.VocabSize {
+		return GenerateResult{}, fmt.Errorf("logprobs requests %d alternatives; model vocabulary contains %d tokens", opts.Logprobs, m.config.VocabSize)
+	}
 	probNative, supportsProbs := m.native.(mlxProbabilityForwarder)
 	if opts.Logprobs > 0 && !supportsProbs {
 		return GenerateResult{}, fmt.Errorf("logprobs requires native MLX")
@@ -297,6 +300,8 @@ func (m *MLX) generate(prompt string, opts GenerateOptions, prefillOnly bool) (G
 	if m.closed {
 		return GenerateResult{}, fmt.Errorf("MLX backend is closed")
 	}
+	residentBefore := len(m.tokens)
+	cacheReasons := []string{}
 	if native, ok := m.native.(interface{ SetKVBits(int) (bool, error) }); ok {
 		bits := opts.KVBits
 		if bits == 0 {
@@ -307,6 +312,7 @@ func (m *MLX) generate(prompt string, opts GenerateOptions, prefillOnly bool) (G
 			return GenerateResult{}, err
 		}
 		if cleared {
+			cacheReasons = append(cacheReasons, "kv-precision-changed")
 			m.tokens = nil
 		}
 	}
@@ -316,11 +322,20 @@ func (m *MLX) generate(prompt string, opts GenerateOptions, prefillOnly bool) (G
 			return GenerateResult{}, err
 		}
 		if cleared {
+			cacheReasons = append(cacheReasons, "context-capacity-shrank")
 			m.tokens = nil
 		}
 	}
 	if m.cmd == nil && m.native == nil {
 		if err := m.start(ctx); err != nil {
+			return GenerateResult{}, err
+		}
+	}
+	plan := cachePlan(m.tokens, ids, len(m.probRows), m.probCount, opts)
+	plan.ResidentTokens = residentBefore
+	plan.Reasons = append(cacheReasons, plan.Reasons...)
+	if opts.OnCachePlan != nil {
+		if err := opts.OnCachePlan(plan); err != nil {
 			return GenerateResult{}, err
 		}
 	}

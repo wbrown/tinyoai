@@ -84,10 +84,26 @@ mkdir -p "$work"
 if [[ -z $mlx_root ]]; then
     mlx_root="$work/runtime-sdk"
     fetch_source mlx "$mlx_revision"
-    echo 'Building MLX 0.32.2 SDK (incremental after the first build).'
+    # Keep the upstream checkout pristine. The project allocator patch is
+    # bound by its contents and builds into a separate cache directory.
+    budget_patch="$repo/native-patches/memory-budget.patch"
+    budget_hash=$(shasum -a 256 "$budget_patch" | cut -d ' ' -f 1)
+    patched_source="$work/mlx-$budget_hash"
+    runtime_build="$work/runtime-build-$budget_hash"
+    if [[ ! -d "$patched_source" ]]; then
+        staged_source=$(mktemp -d "$work/.mlx-patched.XXXXXX")
+        git -C "$work/mlx" archive "$mlx_revision" | tar -x -C "$staged_source"
+        git -C "$staged_source" apply --check "$budget_patch"
+        git -C "$staged_source" apply "$budget_patch"
+        mv "$staged_source" "$patched_source"
+    fi
+    # Tests and the runtime must use the same policy arithmetic, including when
+    # reusing a previously patched source directory.
+    cmp "$repo/native-patches/memory_budget.h" "$patched_source/mlx/backend/metal/memory_budget.h"
+    echo 'Building MLX 0.32.2 SDK with machine-memory headroom policy.'
     # Use the final runtime path while linking, so repeated installs do not
     # try to rewrite load commands in an already-installed library.
-    cmake -S "$work/mlx" -B "$work/runtime-build" \
+    cmake -S "$patched_source" -B "$runtime_build" \
         -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
         -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=26.2 \
         -DCMAKE_INSTALL_PREFIX="$mlx_root" -DCMAKE_INSTALL_LIBDIR=lib \
@@ -96,12 +112,12 @@ if [[ -z $mlx_root ]]; then
         -DMLX_BUILD_TESTS=OFF -DMLX_BUILD_EXAMPLES=OFF \
         -DMLX_BUILD_BENCHMARKS=OFF -DMLX_BUILD_PYTHON_BINDINGS=OFF \
         -DMLX_BUILD_GGUF=OFF -DMLX_METAL_JIT=OFF
-    cmake --build "$work/runtime-build" --parallel "$jobs"
-    cmake --install "$work/runtime-build"
+    cmake --build "$runtime_build" --parallel "$jobs"
+    cmake --install "$runtime_build"
     mkdir -p "$mlx_root/share/licenses"
     cp "$work/mlx/LICENSE" "$mlx_root/share/licenses/MLX.txt"
-    cp "$work/runtime-build/_deps/json-src/LICENSE.MIT" "$mlx_root/share/licenses/nlohmann-json.txt"
-    cp "$work/runtime-build/_deps/fmt-src/LICENSE" "$mlx_root/share/licenses/fmt.txt"
+    cp "$runtime_build/_deps/json-src/LICENSE.MIT" "$mlx_root/share/licenses/nlohmann-json.txt"
+    cp "$runtime_build/_deps/fmt-src/LICENSE" "$mlx_root/share/licenses/fmt.txt"
 fi
 for file in lib/libmlx.dylib lib/libjaccl.dylib lib/mlx.metallib include/mlx/mlx.h include/metal_cpp/LICENSE.txt share/cmake/MLX/MLXConfigVersion.cmake; do
     if [[ ! -f "$mlx_root/$file" ]]; then

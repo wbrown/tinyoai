@@ -39,7 +39,7 @@ type CompletionRequest struct {
 	StreamOptions *streamOptions `json:"stream_options"`
 	// Stop accepts a JSON string, string array, or null.
 	Stop json.RawMessage `json:"stop"`
-	// Logprobs requests up to 64 raw-model alternatives per token; zero disables
+	// Logprobs requests raw-model alternatives per token; zero disables
 	// capture. The backend must support probabilities.
 	Logprobs int `json:"logprobs,omitempty"`
 }
@@ -162,11 +162,11 @@ func (s *Server) completions(w http.ResponseWriter, r *http.Request) {
 // and chooses a fresh seed when omitted. Backend-specific capability checks
 // remain the generator's responsibility.
 func (req CompletionRequest) Options(ctx context.Context) (GenerateOptions, error) {
-	if req.Logprobs < 0 || req.Logprobs > 64 {
-		return GenerateOptions{}, fmt.Errorf("logprobs must be between 0 and 64")
+	if req.Logprobs < 0 {
+		return GenerateOptions{}, fmt.Errorf("logprobs must be nonnegative")
 	}
-	if req.MaxTokens < 1 || req.Temperature < 0 || req.Temperature > 100 || math.IsNaN(req.Temperature) {
-		return GenerateOptions{}, fmt.Errorf("max_tokens must be positive and temperature 0–100")
+	if req.MaxTokens < 1 || req.Temperature < 0 || math.IsInf(req.Temperature, 0) || math.IsNaN(req.Temperature) {
+		return GenerateOptions{}, fmt.Errorf("max_tokens must be positive and temperature finite and nonnegative")
 	}
 	sampling := DefaultSampling()
 	sampling.TopP, sampling.PresencePenalty, sampling.FrequencyPenalty = req.TopP, req.PresencePenalty, req.FrequencyPenalty

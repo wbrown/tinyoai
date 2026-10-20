@@ -6,6 +6,7 @@ package mlx
 #cgo LDFLAGS: -framework Foundation
 #include <stdint.h>
 void tinyoai_mlx_process_metrics(uint64_t*, uint64_t*, int*, int*);
+void tinyoai_mlx_system_memory(uint64_t*, uint64_t*, uint64_t*, uint64_t*, uint64_t*, int*);
 */
 import "C"
 
@@ -30,4 +31,22 @@ func ReadProcessMetrics() ProcessMetrics {
 	var thermal, failure C.int
 	C.tinyoai_mlx_process_metrics(&footprint, &available, &thermal, &failure)
 	return ProcessMetrics{uint64(footprint), uint64(available), int(thermal), int(failure)}
+}
+
+// SystemMemoryMetrics reports physical VM counters, not a process allocation cap.
+type SystemMemoryMetrics struct {
+	PhysicalBytes   uint64 `json:"physical_bytes"`
+	FreeBytes       uint64 `json:"free_bytes"`
+	InactiveBytes   uint64 `json:"inactive_bytes"`
+	WiredBytes      uint64 `json:"wired_bytes"`
+	CompressedBytes uint64 `json:"compressed_bytes"`
+	Error           int    `json:"error,omitempty"`
+}
+
+// ReadSystemMemory samples physical RAM and the OS page queues without MLX locks.
+func ReadSystemMemory() SystemMemoryMetrics {
+	var total, free, inactive, wired, compressed C.uint64_t
+	var failure C.int
+	C.tinyoai_mlx_system_memory(&total, &free, &inactive, &wired, &compressed, &failure)
+	return SystemMemoryMetrics{uint64(total), uint64(free), uint64(inactive), uint64(wired), uint64(compressed), int(failure)}
 }

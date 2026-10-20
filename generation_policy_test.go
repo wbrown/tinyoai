@@ -87,3 +87,36 @@ func TestProbabilityCacheReuse(t *testing.T) {
 		})
 	}
 }
+
+func TestProbabilityCaptureUsesModelVocabulary(t *testing.T) {
+	for _, n := range []int{65, 128, 65536} {
+		if err := validateGeneration(GenerateOptions{Logprobs: n, PromptLogprobs: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &MLX{config: StableLMConfig{VocabSize: 128}}
+	if _, err := m.Generate("unused", GenerateOptions{Logprobs: 129}); err == nil {
+		t.Fatal("accepted more alternatives than the vocabulary")
+	}
+	for _, opts := range []GenerateOptions{{Logprobs: -1}, {PromptLogprobs: true}} {
+		if err := validateGeneration(opts); err == nil {
+			t.Fatal("accepted malformed probability request")
+		}
+	}
+}
+
+func TestCachePlanExplainsProbabilityRebuild(t *testing.T) {
+	opts := GenerateOptions{PromptLogprobs: true, Logprobs: 12}
+	full := cachePlan([]int{0, 1, 2, 3}, []int{0, 1, 2, 3}, 0, 0, opts)
+	if full.CommonTokens != 4 || full.ReusedTokens != 0 || full.PrefillTokens != 4 {
+		t.Fatal(full)
+	}
+	ready := cachePlan([]int{0, 1, 2, 3}, []int{0, 1, 2, 3}, 4, 12, opts)
+	if ready.ReusedTokens != 2 || ready.PrefillTokens != 2 {
+		t.Fatal(ready)
+	}
+	changed := cachePlan([]int{0, 1, 2, 3}, []int{0, 1, 9, 3}, 4, 12, GenerateOptions{})
+	if changed.CommonTokens != 2 || changed.ReusedTokens != 2 {
+		t.Fatal(changed)
+	}
+}

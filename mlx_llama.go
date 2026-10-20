@@ -112,6 +112,9 @@ func (m *LlamaMLX) generate(prompt string, opts GenerateOptions, prefillOnly boo
 	if err := validateGeneration(opts); err != nil {
 		return GenerateResult{}, err
 	}
+	if opts.Logprobs > int(m.model.config.VocabSize) {
+		return GenerateResult{}, fmt.Errorf("logprobs requests %d alternatives; model vocabulary contains %d tokens", opts.Logprobs, m.model.config.VocabSize)
+	}
 	if opts.KVBits != 0 {
 		return GenerateResult{}, fmt.Errorf("Llama MLX uses float32 KV; kv_bits is not supported")
 	}
@@ -129,6 +132,9 @@ func (m *LlamaMLX) generate(prompt string, opts GenerateOptions, prefillOnly boo
 	if opts.ExpectedPromptTokens < 0 || opts.ExpectedPromptTokens > 0 && opts.ExpectedPromptTokens != len(promptTokens) {
 		return GenerateResult{}, fmt.Errorf("prepared prompt token count does not match Llama tokenizer")
 	}
+	if len(promptTokens)+1 > window {
+		return GenerateResult{}, fmt.Errorf("prompt has %d tokens (including BOS), exceeding context length %d", len(promptTokens)+1, window)
+	}
 	ctx := opts.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -145,7 +151,9 @@ func (m *LlamaMLX) generate(prompt string, opts GenerateOptions, prefillOnly boo
 	if err := ctx.Err(); err != nil {
 		return GenerateResult{}, err
 	}
-	if window < m.window {
+	residentBefore := len(m.tokens)
+	shrank := window < m.window
+	if shrank {
 		if err := m.native.Reset(); err != nil {
 			return GenerateResult{}, err
 		}
@@ -153,8 +161,16 @@ func (m *LlamaMLX) generate(prompt string, opts GenerateOptions, prefillOnly boo
 	}
 	m.window = window
 	ids := append([]int{1}, promptTokens...)
-	// Match Model.Generate when a prompt exhausts the context: no completion.
-	ids = ids[:min(len(ids), window)]
+	plan := cachePlan(m.tokens, ids, len(m.probRows), m.probCount, opts)
+	plan.ResidentTokens = residentBefore
+	if shrank {
+		plan.Reasons = append(plan.Reasons, "context-capacity-shrank")
+	}
+	if opts.OnCachePlan != nil {
+		if err := opts.OnCachePlan(plan); err != nil {
+			return GenerateResult{}, err
+		}
+	}
 	prefix := reusablePrefix(m.tokens, ids)
 	prefix = prepareProbabilityCache(prefix, &m.probRows, &m.probCount, opts)
 	m.tokens = m.tokens[:prefix]

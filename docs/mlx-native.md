@@ -116,7 +116,7 @@ fmt.Println(result.CompletionTokens, result.CachedPromptTokens)
 
 Each model serializes requests. MLX command submission also uses a process-wide lock. Cancellation preserves completed chunks and probability rows. Synchronous callbacks must not reenter the same model.
 
-`Close` releases weights and KV. `mlxruntime` reports active, peak, and idle allocations separately from Go's heap. Native KV is memory-only. See [cache lifetime](inference-features.md#cache-precision-capacity-and-memory).
+`Close` releases weights and KV and synchronizes pending native stream work before destroying its stream context. `mlxruntime` reports active, peak, and idle allocations separately from Go's heap. Native KV is memory-only. See [cache lifetime](inference-features.md#cache-precision-capacity-and-memory).
 
 Native StableLM also implements `Forker`. `Fork(ctx)` returns a `GenerationSession` with independent token history, probability records, KV position, adapter selection, and request gate. Base weights, adapter tensors, and initial KV share storage through separately retained handles. Closing either session leaves the other usable.
 
@@ -159,3 +159,61 @@ For `TestMLXNativeParity`, set `TINYOAI_MLX_DIR` to the converted model, `TINYOA
 Set `TINYOAI_MLX_PYTHON` to include Python-worker greedy comparisons. Reports retain logits, per-step KL, IDs, and timings.
 
 Compare sampling with identical cache histories. Batched prefill and a cached one-token forward round differently in FP16, which can change seeded output. Native and Python paths agree for matching cold and warm histories.
+
+## Runtime memory and cache decisions
+
+New contexts preserve MLX's device-derived idle-buffer cache allowance, including
+any explicit caller override. They no longer replace it with a fixed 256 MiB
+macOS or 32 MiB iOS allowance. The October device benchmark tables record the
+old explicit policies; they are historical measurements, not new defaults.
+
+The default macOS SDK build also applies the native [memory-headroom patch](../native-patches/README.md).
+It retains reusable buffers while leaving the requested 10% physical-memory
+margin, accounting for other applications and releasing only idle buffers as
+available memory falls. The native worker maintains this policy even when no
+new tensor allocations occur. Live tensors and requested work are never dropped.
+An externally supplied SDK keeps its own allocator implementation; iOS keeps
+the upstream allocator. The wrapper's iOS cache override is removed, but the
+macOS headroom patch is not applied to iOS.
+
+`GenerateOptions.OnCachePlan` reports the actual cache decision before any
+forward: resident/common/reused/prefill token counts, saved probability-row
+coverage, and reasons such as changed prefixes, KV precision, or missing score
+rows. StableLM and Llama MLX generation/prefill emit these callbacks. CPU
+StableLM also emits them; the stateless legacy CPU Model does not. The callback
+runs under the session gate and must not reenter that session. An error returned
+by the callback prevents model forwards. Context/precision changes can already
+have invalidated the previous cache before the callback runs.
+
+Probability requests are bounded by the loaded model's vocabulary, not a preset
+64-alternative ceiling. Oversized Llama MLX prompts return an error before
+native dispatch instead of silently shortening the input.
+
+This runtime update does not add training, evaluation orchestration, or an HTTP
+batch scheduler. Offline batch measurements in the benchmark report describe
+separate experiments; they do not imply automatic batching of server requests.
+
+### Focused runtime checks
+
+With the native C API and runtime SDK include/library paths configured as above:
+
+```sh
+# No neural inference: request routing, cache decisions and adapter file checks.
+go test -race -run '^(TestMLXCachePlanEntryPoints|TestCachePlanMatchesProbabilityReuse|TestLlamaMLXRejectsOversizedPromptBeforeDispatch|TestLoRAPrecision|TestLoRAValidation|TestLoRAOvercompleteRank)$' .
+
+# Small native allocator/lifecycle checks; requires the patched macOS SDK.
+TINYOAI_TEST_METAL=1 TINYOAI_TEST_HEADROOM=1 \
+  go test -tags mlx -race -run '^(TestContextPreservesCachePolicy|TestIdleCacheHeadroomWorker|TestMachineMemoryBudget)$' ./internal/mlx
+
+# Real Clio and an existing compatible adapter; no training/evaluation worker.
+TINYOAI_CLIO_MODEL=/path/to/clio-mlx \
+TINYOAI_CLIO_ADAPTER=/path/to/adapter MLX_ENABLE_TF32=0 \
+  go test -tags mlx -race -run '^TestClioRuntimeInference$' -v .
+```
+
+The Clio regression creates a temporary F32 copy of the supplied adapter without
+changing its values or the original files. It checks native F32 retention, finite
+logits, adapter effect, exact zero-strength base restoration, parent/child
+lifetime, public cache callbacks, and a 65-alternative probability request.
+It is an inference correctness check, not a quality evaluation. Model files and
+generated test artifacts are not part of the repository.

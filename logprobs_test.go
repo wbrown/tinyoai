@@ -77,7 +77,7 @@ func TestProbabilitySummaryMatchesFullVocabulary(t *testing.T) {
 				total += math.Exp(float64(v) - best)
 			}
 			z := best + math.Log(total)
-			for _, count := range []int{0, 1, 12, 64} {
+			for _, count := range []int{0, 1, 12, 64, 65, 128} {
 				got := summarizeLogits(values, size-1, count)
 				wantIDs := ids[:min(count, size)]
 				if !reflect.DeepEqual(got.IDs, wantIDs) || math.Float64bits(got.Chosen) != math.Float64bits(float64(values[size-1])-z) {

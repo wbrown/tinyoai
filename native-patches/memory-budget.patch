@@ -1,0 +1,257 @@
+--- a/mlx/backend/metal/allocator.cpp
++++ b/mlx/backend/metal/allocator.cpp
+@@ -10,6 +10,17 @@
+ #include <cassert>
+ #include <cstdlib>
+ 
++#include "mlx/backend/metal/memory_budget.h"
++#include <TargetConditionals.h>
++#if TARGET_OS_OSX
++#include <mach/mach.h>
++#include <sys/sysctl.h>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#endif
++
++
+ namespace mlx::core {
+ 
+ constexpr size_t resource_options =
+@@ -41,6 +52,55 @@
+ } // namespace allocator
+ 
+ namespace metal {
++
++namespace {
++#if TARGET_OS_OSX
++std::atomic<size_t> machine_budget{std::numeric_limits<size_t>::max()};
++// Called under the allocator mutex. Sample the OS at most every 100 ms;
++// every allocation still accounts for its bytes against that sampled budget.
++// This is telemetry cadence, not a cap on a training example or live tensor.
++size_t refresh_machine_budget(size_t owned) {
++  using Clock = std::chrono::steady_clock;
++  static auto sampled = Clock::time_point::min();
++  static uint64_t physical = 0;
++  const auto now = Clock::now();
++  if (sampled != Clock::time_point::min() &&
++      now - sampled < std::chrono::milliseconds(100)) {
++    return machine_budget.load(std::memory_order_relaxed);
++  }
++  if (physical == 0) {
++    size_t n = sizeof(physical);
++    if (sysctlbyname("hw.memsize", &physical, &n, nullptr, 0) != 0) {
++      std::fprintf(stderr,"MLX headroom: physical RAM query failed; idle caching disabled until next successful sample\n");
++      machine_budget.store(0, std::memory_order_relaxed); sampled = now; return 0;
++    }
++  }
++  vm_statistics64_data_t vm{};
++  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++  const auto host = mach_host_self();
++  auto status = host_statistics64(host, HOST_VM_INFO64,
++      reinterpret_cast<host_info64_t>(&vm), &count);
++  mach_port_deallocate(mach_task_self(), host);
++  if (status != KERN_SUCCESS) {
++    std::fprintf(stderr,"MLX headroom: available RAM query failed (%d); idle caching disabled until next successful sample\n",status);
++    machine_budget.store(0, std::memory_order_relaxed); sampled = now; return 0;
++  }
++  // Inactive includes anonymous Metal buffers belonging to this allocator.
++  // They are not disposable: counting them as available double-counts owned
++  // memory and can exhaust the compressor when GPU residency is withdrawn.
++  // Only free and explicitly purgeable pages provide immediate headroom.
++  auto available = (uint64_t(vm.free_count) + vm.purgeable_count) * vm_page_size;
++  auto limit = headroom::budget(physical, available, owned);
++  machine_budget.store(limit, std::memory_order_relaxed);
++  sampled = now;
++  return limit;
++}
++#else
++size_t refresh_machine_budget(size_t) {
++  return std::numeric_limits<size_t>::max();
++}
++#endif
++} // namespace
+ 
+ MetalAllocator::MetalAllocator(Device& d)
+     : device_(d.mtl_device()),
+@@ -74,9 +134,35 @@
+   heap_desc->setSize(heap_size_);
+   heap_ = NS::TransferPtr(device_->newHeap(heap_desc));
+   residency_sets_.insert(heap_.get());
+-}
+-
+-MetalAllocator::~MetalAllocator() = default;
++#if TARGET_OS_OSX
++  // Serialization and hashing can run for minutes without any allocations.
++  // Maintain the same reserve during that CPU-only interval. This thread
++  // touches only idle buffers under the allocator's own mutex, never arrays.
++  headroom_worker_ = std::thread([this] {
++    std::unique_lock lk(mutex_);
++    while (!headroom_stopping_) {
++      auto pool = metal::new_scoped_memory_pool();
++      auto budget = refresh_machine_budget(active_memory_ + buffer_cache_.cache_size());
++      auto keep = std::min(max_pool_size_, budget > active_memory_
++          ? budget - active_memory_ : 0);
++      if (buffer_cache_.cache_size() > keep) {
++        num_resources_ -= buffer_cache_.release_cached_buffers(buffer_cache_.cache_size() - keep);
++      }
++      headroom_wakeup_.wait_for(lk, std::chrono::milliseconds(100),
++          [this] { return headroom_stopping_; });
++    }
++  });
++#endif
++}
++
++MetalAllocator::~MetalAllocator() {
++  {
++    std::unique_lock lk(mutex_);
++    headroom_stopping_ = true;
++  }
++  headroom_wakeup_.notify_one();
++  if (headroom_worker_.joinable()) headroom_worker_.join();
++}
+ 
+ size_t MetalAllocator::set_cache_limit(size_t limit) {
+   std::unique_lock lk(mutex_);
+@@ -94,7 +180,12 @@
+ };
+ 
+ size_t MetalAllocator::get_memory_limit() {
++  std::unique_lock lk(mutex_);
++  #if TARGET_OS_OSX
++  return std::min(block_limit_, machine_budget.load(std::memory_order_relaxed));
++#else
+   return block_limit_;
++#endif
+ }
+ 
+ size_t MetalAllocator::set_wired_limit(size_t limit) {
+@@ -127,14 +218,20 @@
+ 
+   // Try the cache
+   std::unique_lock lk(mutex_);
++  auto machine_limit = refresh_machine_budget(
++      active_memory_ + buffer_cache_.cache_size());
+   MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
+   if (!buf) {
+-    size_t mem_required = get_active_memory() + get_cache_memory() + size;
++    size_t mem_required = active_memory_ + buffer_cache_.cache_size() + size;
+ 
+     // If we have a lot of memory pressure try to reclaim memory from the cache
+-    if (mem_required >= gc_limit_ || num_resources_ >= resource_limit_) {
+-      num_resources_ -=
+-          buffer_cache_.release_cached_buffers(mem_required - gc_limit_);
++    auto effective_gc = std::min(gc_limit_, machine_limit);
++    if (mem_required >= effective_gc || num_resources_ >= resource_limit_) {
++      auto release = headroom::excess(active_memory_, buffer_cache_.cache_size(), size, effective_gc);
++      if (num_resources_ >= resource_limit_) {
++        release = buffer_cache_.cache_size();
++      }
++      num_resources_ -= buffer_cache_.release_cached_buffers(release);
+     }
+ 
+     // Allocate new buffer if needed
+@@ -166,10 +263,13 @@
+   active_memory_ += buf->length();
+   peak_memory_ = std::max(peak_memory_, active_memory_);
+ 
+-  // Maintain the cache below the requested limit
+-  if (get_cache_memory() > max_pool_size_) {
++  // Apply the combined live+idle budget on cache hits too. A hit transfers
++  // ownership from idle to live; it does not create additional headroom.
++  auto cache_limit = std::min(max_pool_size_, machine_limit > active_memory_
++      ? machine_limit - active_memory_ : 0);
++  if (buffer_cache_.cache_size() > cache_limit) {
+     num_resources_ -= buffer_cache_.release_cached_buffers(
+-        get_cache_memory() - max_pool_size_);
++        buffer_cache_.cache_size() - cache_limit);
+   }
+ 
+   return Buffer{static_cast<void*>(buf)};
+@@ -187,7 +287,12 @@
+   }
+   std::unique_lock lk(mutex_);
+   active_memory_ -= buf->length();
+-  if (get_cache_memory() < max_pool_size_) {
++  auto machine_limit = refresh_machine_budget(
++      active_memory_ + buffer_cache_.cache_size() + buf->length());
++  auto cache_limit = std::min(max_pool_size_, machine_limit > active_memory_
++      ? machine_limit - active_memory_ : 0);
++  if (buf->length() <= cache_limit &&
++      buffer_cache_.cache_size() <= cache_limit - buf->length()) {
+     buffer_cache_.recycle_to_cache(buf);
+   } else {
+     num_resources_--;
+--- a/mlx/backend/metal/allocator.h
++++ b/mlx/backend/metal/allocator.h
+@@ -4,6 +4,8 @@
+ 
+ #include <map>
+ #include <mutex>
++#include <thread>
++#include <condition_variable>
+ #include <vector>
+ 
+ #include "mlx/allocator.h"
+@@ -24,9 +26,11 @@
+   virtual void release(Buffer buffer) override;
+ 
+   size_t get_active_memory() {
++    std::unique_lock lk(mutex_);
+     return active_memory_;
+   };
+   size_t get_peak_memory() {
++    std::unique_lock lk(mutex_);
+     return peak_memory_;
+   };
+   void reset_peak_memory() {
+@@ -34,6 +38,7 @@
+     peak_memory_ = 0;
+   };
+   size_t get_cache_memory() {
++    std::unique_lock lk(mutex_);
+     return buffer_cache_.cache_size();
+   };
+   size_t set_cache_limit(size_t limit);
+@@ -73,6 +78,9 @@
+   size_t resource_limit_{0};
+ 
+   std::mutex mutex_;
++  std::thread headroom_worker_;
++  std::condition_variable headroom_wakeup_;
++  bool headroom_stopping_{false};
+ };
+ 
+ MetalAllocator& allocator();
+--- /dev/null
++++ b/mlx/backend/metal/memory_budget.h
+@@ -0,0 +1,29 @@
++// Native allocator headroom policy. The 10% physical-RAM reserve is an
++// explicit user requirement (2026-10-17), not a workload/data limit.
++#pragma once
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++
++namespace mlx::core::metal::headroom {
++inline uint64_t add(uint64_t a, uint64_t b) {
++  return b > std::numeric_limits<uint64_t>::max() - a
++      ? std::numeric_limits<uint64_t>::max() : a + b;
++}
++inline uint64_t reserve(uint64_t physical) {
++  return physical / 10 + (physical % 10 != 0);
++}
++// available counts free + explicitly purgeable physical pages. Inactive
++// anonymous pages may belong to owned buffers and must not be counted again.
++// Speculative pages are already included in free.
++inline uint64_t budget(uint64_t physical, uint64_t available, uint64_t owned) {
++  const auto held = reserve(physical);
++  const auto capacity = std::min(physical, add(owned, available));
++  return capacity > held ? capacity - held : 0;
++}
++inline uint64_t excess(uint64_t active, uint64_t cached, uint64_t incoming,
++                       uint64_t budget) {
++  const auto wanted = add(add(active, cached), incoming);
++  return wanted > budget ? std::min(cached, wanted - budget) : 0;
++}
++} // namespace mlx::core::metal::headroom

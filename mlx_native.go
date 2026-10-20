@@ -177,11 +177,22 @@ func (n *nativeMLX) linear(a *mx.Arena, x mx.Array, w mlxMatrix) mx.Array {
 	y := n.baseLinear(a, x, w)
 	if n.activeLoRA() {
 		if pair, ok := n.lora.pairs[w.weight]; ok {
-			delta := a.Matmul(a.Matmul(x, a.Transpose(pair.a, 1, 0)), a.Transpose(pair.b, 1, 0))
-			y = a.Add(y, a.Scale(delta, n.lora.factor))
+			y = addLoRA(a, x, y, pair, n.lora.factor)
 		}
 	}
 	return y
+}
+
+// addLoRA applies the adapter correction during inference. F32 matrices
+// retain F32 correction arithmetic; the result returns to the base activation
+// dtype at the residual boundary. F16 pairs preserve their original rounding.
+func addLoRA(a *mx.Arena, x, base mx.Array, pair mlxLoRAPair, factor float32) mx.Array {
+	dtype := mx.Float16
+	if pair.a.Dtype() == mx.Float32 || pair.b.Dtype() == mx.Float32 {
+		dtype = mx.Float32
+	}
+	delta := a.Matmul(a.Matmul(a.Cast(x, dtype), a.Transpose(a.Cast(pair.a, dtype), 1, 0)), a.Transpose(a.Cast(pair.b, dtype), 1, 0))
+	return a.Add(base, a.Cast(a.Scale(delta, factor), base.Dtype()))
 }
 
 // baseLinear preserves the original dense and quantized projection paths.
@@ -286,7 +297,7 @@ func (n *nativeMLX) Forward(ctx context.Context, prefix int, tokens []int, wantL
 // vocabulary. Targets align one-for-one with input positions; the final
 // full-vocabulary logits are also returned.
 func (n *nativeMLX) ForwardWithLogprobs(ctx context.Context, prefix int, tokens, targets []int, count int) ([]float32, []logprobRow, error) {
-	if len(targets) != len(tokens) || count < 1 || count > 64 {
+	if len(targets) != len(tokens) || count < 1 || count > n.config.VocabSize {
 		return nil, nil, fmt.Errorf("invalid probability request")
 	}
 	for _, id := range targets {

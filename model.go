@@ -220,6 +220,11 @@ type GenerateOptions struct {
 	// OnLogprobs receives synchronous raw-model probability events when capture
 	// is enabled.
 	OnLogprobs func(ProbabilityEvent)
+	// OnCachePlan reports reusable-prefix decisions in StableLM and native MLX
+	// sessions before forwards. It runs synchronously under the session's gate;
+	// do not reenter that session. Returning an error prevents the forwards.
+	// The stateless legacy CPU Model does not emit cache plans.
+	OnCachePlan func(CachePlan) error
 	// ContextLength optionally uses a smaller window than the model supports.
 	ContextLength int
 	// KVBits selects backend KV storage precision; 0 uses that backend's default.
