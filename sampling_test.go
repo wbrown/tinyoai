@@ -166,3 +166,23 @@ func BenchmarkSamplingCandidates(b *testing.B) {
 		})
 	}
 }
+
+func TestSamplingControlsHaveNoArbitraryUpperBounds(t *testing.T) {
+	o := DefaultSampling()
+	o.TopK = 100000
+	o.RepetitionPenalty = 20
+	o.RepetitionRange = 16384
+	o.RepetitionSlope = 20
+	o.PresencePenalty = 20
+	o.FrequencyPenalty = -20
+	if err := o.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	logits := []float32{1, 2, 3}
+	got := penalizedLogits(logits, []int{0, 1}, o)
+	for _, v := range got {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			t.Fatal(got)
+		}
+	}
+}

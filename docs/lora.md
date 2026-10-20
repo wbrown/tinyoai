@@ -17,7 +17,7 @@ adapter_model.safetensors
 
 The configuration must specify `peft_type: "LORA"`, rank `r`, `lora_alpha`, and a list of target projections. Supported targets are `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, and `down_proj`. Each listed target must have A/B tensors in every layer, using PEFT names such as `base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight`.
 
-The loader accepts F32, BF16, or F16 adapter tensors and stores them as FP16. It rejects missing or extra tensors, shape/rank mismatches, non-finite values, and values that would overflow FP16. Bias training, DoRA, rsLoRA, per-layer rank/alpha patterns, selective layer sets, saved replacement modules, and other non-default variants are rejected. Embedding and vocabulary-head adapters are not supported.
+The loader retains F32 and F16 adapter tensors at their original precision and widens BF16 exactly to F32. It rejects missing or extra tensors, shape/rank mismatches and non-finite values. F32 adapter corrections use F32 arithmetic before returning to the base activation dtype at the residual boundary; F16 pairs retain their original rounding. Bias training, DoRA, rsLoRA, per-layer rank/alpha patterns, selective layer sets, saved replacement modules, and other non-default variants are rejected. Embedding and vocabulary-head adapters are not supported.
 
 For an input `x`, ordinary base projection `xWᵀ`, and adapter matrices A and B:
 
@@ -25,9 +25,9 @@ For an input `x`, ordinary base projection `xWᵀ`, and adapter matrices A and B
 y = xWᵀ + strength × (alpha / rank) × ((xAᵀ)Bᵀ)
 ```
 
-Strength defaults to 1 in the server. Zero bypasses the correction entirely. Negative strengths are allowed; the effective multiplier must fit FP16. Its scalar multiplication uses FP16 rounding, like the activations.
+Strength defaults to 1 in the server. Zero bypasses the correction entirely. Negative strengths are allowed. The effective multiplier must be finite and representable in every projection's arithmetic. A pair containing either F32 matrix computes in F32; an all-F16 pair computes in F16. `ArithmeticDtype` reports the limiting precision across these pairs, so a mixed adapter is not unnecessarily treated as F16 when all of its pairs compute in F32.
 
-A rank-8 adapter across all seven projections of a 28-layer 2816-wide model occupies about 24 MB after conversion. Additional GPU dispatches can affect throughput despite the small matrices.
+A rank-8 adapter across all seven projections of a 28-layer 2816-wide model occupies about 24 MB as F16 or 48 MB as F32. Additional GPU dispatches can affect throughput despite the small matrices. Overcomplete ranks are accepted when the declared A/B shapes match; rank is not capped at the projection width.
 
 ## Library use
 
@@ -54,7 +54,9 @@ return err
 
 `LoRAInfo(ctx)` reports the combined SHA-256 of configuration and weight-file bytes, declared base model, rank, alpha, strength, projection count, and retained adapter bytes. Its SHA is empty when no adapter is loaded. Loading a directory again rereads it; `SetLoRAScale` reuses the resident tensors.
 
-`Scale` reports the requested strength before multiplication by `Alpha/Rank`. `Projections` counts adapted base matrices across all layers. `Bytes` counts FP16 adapter tensor storage without allocator overhead or workspaces. Forks can share those tensors, so summing their reports can count the same storage more than once.
+`Scale` reports the requested strength before multiplication by `Alpha/Rank`. `Projections` counts adapted base matrices across all layers. `Dtype` reports resident F16, F32, or mixed tensors. `Bytes` counts their actual storage without allocator overhead or workspaces. Forks can share those tensors, so summing their reports can count the same storage more than once.
+
+`ValidateLoRA(ctx, dir, config)` runs the same configuration, shape and finite-value checks without loading a model or allocating GPU tensors. It reads one tensor at a time and does not establish the adapter's training provenance.
 
 Calls serialize with generation, prefill, word branches, and close. The loader constructs and evaluates the new adapter before replacing the old one. A failed or cancelled load preserves the previous adapter and cache. Cancellation after a native commit does not undo that commit; inspect `LoRAInfo` if a client loses its response.
 

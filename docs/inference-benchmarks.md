@@ -6,7 +6,7 @@ Saved Go/native MLX runs cover device throughput, KV precision, prefix reuse, ca
 
 The October 1–3, 2026 runs use the same Clio affine group-64 Q6 weights and group-64 Q8 KV. Prefill includes top-12 prompt probabilities, using 512-token transformer chunks, 64-row scoring batches, and 1024-entry top-k blocks. Model loading and full-prompt warm-up are excluded. Each run starts with empty KV, records 32 output decisions, and times the 31 decode forwards after prefill.
 
-Times and rates are medians of three runs. Peak process memory is the largest physical-footprint sample, taken every 100 ms; child processes are excluded. GB is decimal. The allocator's idle pool is capped at 256 MiB on macOS and 32 MiB on iOS, separately from the retained KV cache.
+Times and rates are medians of three runs. Peak process memory is the largest physical-footprint sample, taken every 100 ms; child processes are excluded. GB is decimal. These historical runs capped the allocator's idle pool at 256 MiB on macOS and 32 MiB on iOS, separately from retained KV. Current runtime builds preserve the device policy and apply macOS machine-memory headroom as described in [the runtime guide](mlx-native.md#runtime-memory-and-cache-decisions).
 
 ```text
 | Device   | Prompt tokens | Prefill s | Prefill tok/s | Decode tok/s | Peak process GB |

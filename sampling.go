@@ -51,9 +51,8 @@ func (o SamplingOptions) Validate() error {
 			return fmt.Errorf("sampling values must be finite")
 		}
 	}
-	if o.TopK < 0 || o.TopK > 65536 || o.TopP <= 0 || o.TopP > 1 || o.TFS <= 0 || o.TFS > 1 ||
-		o.RepetitionPenalty < 1 || o.RepetitionPenalty > 16 || o.RepetitionRange < 0 || o.RepetitionRange > 8192 ||
-		o.RepetitionSlope < 0 || o.RepetitionSlope > 10 || math.Abs(o.PresencePenalty) > 16 || math.Abs(o.FrequencyPenalty) > 16 {
+	if o.TopK < 0 || o.TopP <= 0 || o.TopP > 1 || o.TFS <= 0 || o.TFS > 1 ||
+		o.RepetitionPenalty < 1 || o.RepetitionRange < 0 || o.RepetitionSlope < 0 {
 		return fmt.Errorf("sampling value out of range")
 	}
 	return nil

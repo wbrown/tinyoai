@@ -1,6 +1,7 @@
 package tinyoai
 
 import (
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
@@ -59,11 +60,28 @@ func TestCoreCompletionAndStandardProbabilities(t *testing.T) {
 // TestCoreCompletionValidation rejects malformed JSON, unsupported prompt
 // shapes, invalid limits, and invalid sampling values before generation.
 func TestCoreCompletionValidation(t *testing.T) {
-	for _, body := range []string{`{"prompt":[3]}`, `{"max_tokens":0}`, `{"stop":3}`, `{} {}`, `{"logprobs":65}`, `{"top_p":0}`} {
+	for _, body := range []string{`{"prompt":[3]}`, `{"max_tokens":0}`, `{"stop":3}`, `{} {}`, `{"top_p":0}`} {
 		w := httptest.NewRecorder()
 		NewServer(&apiGenerator{}).ServeHTTP(w, httptest.NewRequest("POST", "/v1/completions", strings.NewReader(body)))
 		if w.Code != 400 {
 			t.Fatal(body, w.Code)
 		}
+	}
+}
+
+func TestCompletionTemperatureIsFiniteNonnegativeWithoutPresetCeiling(t *testing.T) {
+	request := DefaultCompletionRequest()
+	request.Temperature = 101
+	if _, err := request.Options(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompletionAllowsProbabilityWidthBeyondOldCeiling(t *testing.T) {
+	request := DefaultCompletionRequest()
+	request.Logprobs = 128
+	opts, err := request.Options(context.Background())
+	if err != nil || opts.Logprobs != 128 {
+		t.Fatalf("%+v %v", opts, err)
 	}
 }

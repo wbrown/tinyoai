@@ -62,6 +62,7 @@ type logprobRow struct {
 // always includes every vocabulary entry; the shortlist only reduces retained
 // output. Ties favor the lower token ID.
 func summarizeLogits(logits []float32, chosen, count int) logprobRow {
+	count = min(count, len(logits))
 	best := float64(logits[0])
 	for _, v := range logits {
 		best = math.Max(best, float64(v))

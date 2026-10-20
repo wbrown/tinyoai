@@ -495,6 +495,11 @@ func (m *StableLM) Generate(prompt string, opts GenerateOptions) (GenerateResult
 	}
 	saved.resize(m, steps)
 	s := saved.state
+	if opts.OnCachePlan != nil {
+		if err := opts.OnCachePlan(cachePlan(saved.tokens, ids, 0, 0, opts)); err != nil {
+			return GenerateResult{}, err
+		}
+	}
 	prefix := reusablePrefix(saved.tokens, ids)
 	// Re-evaluate the final prompt token even on a full hit to obtain its
 	// logits. A failed/cancelled suffix never becomes valid cached state.

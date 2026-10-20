@@ -78,9 +78,16 @@ func (n *nativeMLX) loadLoRA(ctx context.Context, dir string, scale float64) (Lo
 				mx.Fail("missing base projection %s", tensors[i].name)
 			}
 			pair := mlxLoRAPair{}
-			pair.a = a.Cast(a.FloatArray(tensors[i].values, tensors[i].shape...), mx.Float16).Retain()
+			cast := func(t loRATensor) mx.Array {
+				value := a.FloatArray(t.values, t.shape...)
+				if t.dtype == "F16" {
+					value = a.Cast(value, mx.Float16)
+				}
+				return value.Retain()
+			}
+			pair.a = cast(tensors[i])
 			next.pairs[key] = pair
-			pair.b = a.Cast(a.FloatArray(tensors[i+1].values, tensors[i+1].shape...), mx.Float16).Retain()
+			pair.b = cast(tensors[i+1])
 			next.pairs[key] = pair
 			all = append(all, pair.a, pair.b)
 		}

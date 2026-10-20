@@ -25,9 +25,14 @@ type LoRAInfo struct {
 	Alpha float64 `json:"alpha,omitempty"`
 	// Scale is the requested strength, before multiplying by Alpha/Rank.
 	Scale float64 `json:"scale"`
+	// Dtype is F16, F32, or mixed, describing resident adapter tensors.
+	Dtype string `json:"dtype,omitempty"`
+	// ArithmeticDtype is F16 if any projection computes its correction in F16;
+	// otherwise it is F32, including mixed pairs promoted to F32.
+	ArithmeticDtype string `json:"arithmetic_dtype,omitempty"`
 	// Projections counts adapted base matrices across all layers, one per A/B pair.
 	Projections int `json:"projections,omitempty"`
-	// Bytes counts retained FP16 tensor storage, excluding overhead and workspaces.
+	// Bytes counts retained tensor storage, excluding overhead and workspaces.
 	// Forks can share these bytes; summing their reports would count storage twice.
 	Bytes uint64 `json:"bytes,omitempty"`
 }
@@ -71,7 +76,7 @@ func (m *MLX) LoadLoRA(ctx context.Context, dir string, scale float64) (LoRAInfo
 
 // SetLoRAScale changes the loaded adapter's strength without rereading weights.
 // Zero bypasses the correction; negative strengths are allowed. The effective
-// alpha/rank multiplier must be finite and representable in FP16.
+// alpha/rank multiplier must fit the adapter's arithmetic precision.
 func (m *MLX) SetLoRAScale(ctx context.Context, scale float64) (LoRAInfo, error) {
 	return m.withLoRA(ctx, true, func(_ context.Context, n mlxLoRAForwarder) (LoRAInfo, error) {
 		return n.setLoRAScale(scale)
@@ -128,6 +133,7 @@ type loRATensor struct {
 	name   string
 	shape  []int
 	values []float32
+	dtype  string
 }
 
 // parseLoRAConfig accepts PEFT's ordinary inference form. Training metadata
@@ -195,20 +201,44 @@ func parseLoRAConfig(data []byte) (loRAConfig, error) {
 	return c, nil
 }
 
-// loRAScale checks the scalar before it reaches a half-precision graph.
+// loRAScale checks the scalar against the adapter's arithmetic precision.
 func loRAScale(info LoRAInfo, scale float64) (float32, error) {
 	factor := scale * info.Alpha / float64(info.Rank)
-	if math.IsNaN(scale) || math.IsInf(scale, 0) || math.IsNaN(factor) || math.IsInf(factor, 0) || math.Abs(factor) > 65504 {
-		return 0, fmt.Errorf("LoRA scale must have a finite FP16 alpha/rank multiplier")
+	limit := float64(math.MaxFloat32)
+	precision := info.ArithmeticDtype
+	if precision == "" {
+		precision = info.Dtype
+	}
+	if precision != "F32" {
+		limit = 65504
+	}
+	if math.IsNaN(scale) || math.IsInf(scale, 0) || math.IsNaN(factor) || math.IsInf(factor, 0) || math.Abs(factor) > limit {
+		return 0, fmt.Errorf("LoRA multiplier is not representable in %s", precision)
 	}
 	return float32(factor), nil
 }
 
 // readLoRA validates the complete tensor set against this architecture and
-// copies finite, FP16-representable values from one open file descriptor.
+// copies finite values from one open file descriptor without narrowing F32.
 // Tensor names use PEFT's base_model.model prefix; partial layer selections,
 // extra tensors, and mismatched ranks fail before any native state changes.
 func readLoRA(ctx context.Context, dir string, model StableLMConfig, scale float64) (LoRAInfo, []loRATensor, error) {
+	return inspectLoRA(ctx, dir, model, scale, true)
+}
+
+// ValidateLoRA checks a PEFT adapter using the same configuration, tensor,
+// precision and finite-value checks as native loading, without loading a model
+// or allocating GPU tensors. It retains only the current tensor while checking.
+// Shape compatibility does not establish the adapter's training provenance.
+func ValidateLoRA(ctx context.Context, dir string, model StableLMConfig) (LoRAInfo, error) {
+	if err := model.validate(); err != nil {
+		return LoRAInfo{}, err
+	}
+	info, _, err := inspectLoRA(ctx, dir, model, 1, false)
+	return info, err
+}
+
+func inspectLoRA(ctx context.Context, dir string, model StableLMConfig, scale float64, retain bool) (LoRAInfo, []loRATensor, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "adapter_config.json"))
 	if err != nil {
 		return LoRAInfo{}, nil, err
@@ -217,10 +247,7 @@ func readLoRA(ctx context.Context, dir string, model StableLMConfig, scale float
 	if err != nil {
 		return LoRAInfo{}, nil, err
 	}
-	info := LoRAInfo{BaseModel: c.BaseModel, Rank: c.Rank, Alpha: c.Alpha, Scale: scale, Projections: len(c.Targets) * model.NumHiddenLayers}
-	if _, err := loRAScale(info, scale); err != nil {
-		return LoRAInfo{}, nil, err
-	}
+	info := LoRAInfo{BaseModel: c.BaseModel, Rank: c.Rank, Alpha: c.Alpha, Scale: scale, Projections: len(c.Targets) * model.NumHiddenLayers, ArithmeticDtype: "F32"}
 	f, err := openSafeFile(filepath.Join(dir, "adapter_model.safetensors"))
 	if err != nil {
 		return LoRAInfo{}, nil, err
@@ -248,28 +275,51 @@ func readLoRA(ctx context.Context, dir string, model StableLMConfig, scale float
 			case "down_proj":
 				group, input = "mlp", model.IntermediateSize
 			}
-			if c.Rank > min(input, output) {
-				return LoRAInfo{}, nil, fmt.Errorf("LoRA rank %d exceeds %s dimensions", c.Rank, target)
-			}
 			name := fmt.Sprintf("model.layers.%d.%s.%s", layer, group, target)
+			var firstDtype string
 			for i, shape := range [][]int{{c.Rank, input}, {output, c.Rank}} {
 				suffix := []string{".lora_A.weight", ".lora_B.weight"}[i]
 				w, err := store.load("base_model.model."+name+suffix, shape...)
 				if err != nil {
 					return LoRAInfo{}, nil, err
 				}
-				values := make([]float32, shape[0]*shape[1])
-				for j := range values {
+				count := shape[0] * shape[1]
+				var values []float32
+				if retain {
+					values = make([]float32, count)
+				}
+				dtype, bytes := "F32", uint64(4)
+				if w.dtype == "F16" {
+					dtype, bytes = "F16", 2
+				}
+				if i == 0 {
+					firstDtype = dtype
+				} else if firstDtype == "F16" && dtype == "F16" {
+					info.ArithmeticDtype = "F16"
+				}
+				if info.Dtype == "" {
+					info.Dtype = dtype
+				} else if info.Dtype != dtype {
+					info.Dtype = "mixed"
+				}
+				for j := 0; j < count; j++ {
 					v := w.at(j)
-					if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) || math.Abs(float64(v)) > 65504 {
+					if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
 						return LoRAInfo{}, nil, fmt.Errorf("LoRA tensor %s%s has a non-finite or overflowing value", name, suffix)
 					}
-					values[j] = v
+					if retain {
+						values[j] = v
+					}
 				}
-				info.Bytes += uint64(len(values)) * 2
-				tensors = append(tensors, loRATensor{name: name, shape: shape, values: values})
+				info.Bytes += uint64(count) * bytes
+				if retain {
+					tensors = append(tensors, loRATensor{name: name, shape: shape, values: values, dtype: dtype})
+				}
 			}
 		}
+	}
+	if _, err := loRAScale(info, scale); err != nil {
+		return LoRAInfo{}, nil, err
 	}
 	hash := sha256.New()
 	hash.Write(data)

@@ -113,8 +113,8 @@ type Context struct {
 
 // New opens explicit GPU and CPU streams and a compiled SwiGLU closure. It
 // must run under Run; unsupported devices fail through the native error
-// boundary. It also sets process-wide allocator limits: a small idle-buffer
-// cache and, on macOS, the recommended wired-memory allowance.
+// boundary. It preserves MLX's device-derived cache policy (or an explicit
+// caller override). macOS also uses the recommended wired-memory allowance.
 func New() *Context {
 	// Verified with the iOS 27 simulator: Metal compute works, but MLX's shared
 	// heap allocation asserts. Reject it before entering the native allocator.
@@ -148,11 +148,6 @@ func New() *Context {
 		check(1)
 	}
 	var old C.size_t
-	cacheLimit := 256 << 20
-	if runtime.GOOS == "ios" {
-		cacheLimit = 32 << 20
-	}
-	check(C.mlx_set_cache_limit(&old, C.size_t(cacheLimit)))
 	if runtime.GOOS != "ios" {
 		info := C.mlx_device_info_new()
 		defer C.mlx_device_info_free(info)
@@ -170,17 +165,35 @@ func New() *Context {
 	return c
 }
 
-// Close releases the context streams and compiled closure, then clears idle
-// allocator buffers. Call it under Run after releasing dependent arrays; a nil
-// context is allowed.
+// Close drains pending stream work before releasing streams and the compiled
+// closure, then clears idle allocator buffers. GPU completion handlers may still
+// own buffers after their Go handles are freed. Call under Run after releasing
+// dependent arrays; a nil context is allowed.
 func (c *Context) Close() {
 	if c == nil {
 		return
+	}
+	var status C.int
+	if c.stream.ctx != nil {
+		status = C.mlx_synchronize(c.stream)
+	}
+	if c.cpu.ctx != nil {
+		if rc := C.mlx_synchronize(c.cpu); status == 0 {
+			status = rc
+		}
 	}
 	C.mlx_closure_free(c.swiglu)
 	C.mlx_stream_free(c.stream)
 	C.mlx_stream_free(c.cpu)
 	C.mlx_clear_cache()
+	check(status)
+}
+
+// Synchronize drains this context's streams, including completion handlers,
+// before a phase transition releases idle buffers. Call under Run.
+func (c *Context) Synchronize() {
+	check(C.mlx_synchronize(c.stream))
+	check(C.mlx_synchronize(c.cpu))
 }
 
 // Arena owns temporary array handles for a lazy graph. Operations return
@@ -663,8 +676,19 @@ func StartCapture(path string) {
 // StopCapture ends the active Metal diagnostic capture under Run.
 func StopCapture() { check(C.mlx_metal_stop_capture()) }
 
-// SetCacheLimit changes the cap on unused allocations, not live tensors.
-func SetCacheLimit(bytes uint64) {
+// SetCacheLimit changes the cap on unused allocations, not live tensors, and
+// returns the previous value so a scoped diagnostic can restore it. Call under Run.
+func SetCacheLimit(bytes uint64) uint64 {
 	var old C.size_t
 	check(C.mlx_set_cache_limit(&old, C.size_t(bytes)))
+	return uint64(old)
+}
+
+// MemoryLimit returns the native graph scheduler's current allocation guideline.
+// The patched macOS allocator also bounds idle buffers against this machine
+// headroom budget on cache hits, allocation and release. Call under Run.
+func MemoryLimit() uint64 {
+	var limit C.size_t
+	check(C.mlx_get_memory_limit(&limit))
+	return uint64(limit)
 }
