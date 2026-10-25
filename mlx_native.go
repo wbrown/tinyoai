@@ -38,6 +38,7 @@ type nativeMLX struct {
 	fusedProjections    bool
 	projectionsPacked   bool
 	densePrefill        bool
+	stableKVWorkspace   bool // Capacity-shaped dense attention buffers; diagnostics may disable.
 	onPrefillChunk      func(MLXPrefillChunk)
 	capturePath         string
 	capturePrefix       int
@@ -81,7 +82,7 @@ func LoadMLXNative(dir string) (*MLX, error) {
 	}
 	n := &nativeMLX{
 		config: m.config, group: group, bits: bits, kvBits: 16,
-		weights: make(map[string]mx.Array),
+		weights: make(map[string]mx.Array), stableKVWorkspace: true,
 		// Exact hierarchical selection avoids sorting the full vocabulary.
 		// Keep the original one-token sampling head; only saved prompt scores
 		// use the larger batch. See the retained prefill experiment results.
@@ -222,11 +223,14 @@ func (n *nativeMLX) reset() {
 	n.offset = 0
 }
 
-// LimitCache discards KV if its retained capacity exceeds limit. Selecting a
+// LimitCache reserves the caller's already-validated context capacity, so prefill
+// does not repeatedly copy growing KV and leave obsolete sizes in the allocator.
+// It discards KV if its retained capacity exceeds limit. Selecting a
 // smaller context therefore releases the larger allocation even when the new
 // prompt shares a prefix; cleared reports that invalidation.
 func (n *nativeMLX) LimitCache(limit int) (cleared bool, err error) {
 	err = mx.Run(func() {
+		n.reserveTokens = limit
 		for _, layer := range n.layers {
 			if layer.keys.data.Valid() && layer.keys.data.Shape()[2] > limit {
 				n.reset()
@@ -374,6 +378,13 @@ func (n *nativeMLX) forward(ctx context.Context, prefix int, tokens []int, wantL
 			var attn mx.Array
 			if n.kvBits == 8 && length == 1 && c.NumAttentionHeads == c.NumKeyValueHeads {
 				attn = quantizedDecodeAttention(a, q, cachedK, cachedV, scale)
+			} else if n.stableKVWorkspace && n.kvBits == 8 {
+				// Reuse capacity-shaped dense buffers across prefill chunks and
+				// replay lengths. Attention sees only populated positions; spare
+				// and abandoned suffix slots remain outside the logical view.
+				keys := a.Slice(l.keys.dense(a), 2, 0, prefix+length)
+				values := a.Slice(l.values.dense(a), 2, 0, prefix+length)
+				attn = a.Attention(q, keys, values, scale, length > 1)
 			} else {
 				attn = a.Attention(q, cachedK.dense(a), cachedV.dense(a), scale, length > 1)
 			}
